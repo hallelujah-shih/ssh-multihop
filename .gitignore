@@ -1,5 +1,5 @@
 # Binaries
-ssh-multihop
+./ssh-multihop
 
 # Build artifacts
 *.exe
