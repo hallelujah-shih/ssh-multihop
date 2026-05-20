@@ -73,9 +73,10 @@ func (d *Database) UpdateForward(forward *Forward) error {
 	return d.db.Save(forward).Error
 }
 
-// DeleteForward deletes a forward
+// DeleteForward deletes a forward using hard delete
+// Deprecated: Use DeleteForwardAndStatus for atomic deletion with status
 func (d *Database) DeleteForward(id string) error {
-	return d.db.Delete(&Forward{}, "id = ?", id).Error
+	return d.db.Unscoped().Delete(&Forward{}, "id = ?", id).Error
 }
 
 // CreateOrUpdateStatus creates or updates forward status
