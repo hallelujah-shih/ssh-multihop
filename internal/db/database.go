@@ -127,9 +127,8 @@ type ForwardWithStatus struct {
 	ServiceAddr string         `gorm:"column:service_addr" json:"service_addr"`
 	MaxConns    int            `gorm:"column:max_conns" json:"max_conns"`
 	Description string         `gorm:"column:description" json:"description"`
-	CreatedAt   time.Time      `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt   time.Time      `gorm:"column:updated_at" json:"updated_at"`
-	DeletedAt   gorm.DeletedAt `gorm:"column:deleted_at" json:"-"`
+	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
 
 	// Status fields (from forward_status table, may be null)
 	Status        *string    `gorm:"column:status" json:"status,omitempty"`
@@ -150,7 +149,6 @@ func (fws *ForwardWithStatus) ToForward() Forward {
 		Description: fws.Description,
 		CreatedAt:   fws.CreatedAt,
 		UpdatedAt:   fws.UpdatedAt,
-		DeletedAt:   fws.DeletedAt,
 	}
 }
 
@@ -191,7 +189,6 @@ func (d *Database) ListForwardsWithStatus() ([]ForwardWithStatus, error) {
 			f.description,
 			f.created_at,
 			f.updated_at,
-			f.deleted_at,
 			fs.status,
 			fs.last_heartbeat,
 			fs.error_message
