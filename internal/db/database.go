@@ -105,6 +105,20 @@ func (d *Database) DeleteStatus(forwardID string) error {
 	return d.db.Delete(&ForwardStatus{}, "forward_id = ?", forwardID).Error
 }
 
+// DeleteForwardAndStatus deletes both forward and its status in a transaction
+// Uses hard delete (Unscoped) to allow recreating the same forward
+func (d *Database) DeleteForwardAndStatus(id string) error {
+	return d.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Unscoped().Delete(&Forward{}, "id = ?", id).Error; err != nil {
+			return err
+		}
+		if err := tx.Delete(&ForwardStatus{}, "forward_id = ?", id).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 // CleanStatuses removes all status records
 func (d *Database) CleanStatuses() error {
 	return d.db.Exec("DELETE FROM forward_status").Error
