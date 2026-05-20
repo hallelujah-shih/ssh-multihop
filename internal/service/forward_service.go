@@ -556,17 +556,11 @@ func (s *ForwardService) CreateForward(fwd *db.Forward) error {
 
 // DeleteForward deletes a forward (DB only, sync loop will stop it)
 func (s *ForwardService) DeleteForward(id string) error {
-	// Delete from database (快速操作，~5ms)
-	if err := s.db.DeleteForward(id); err != nil {
+	if err := s.db.DeleteForwardAndStatus(id); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrForwardNotFound
 		}
 		return fmt.Errorf("failed to delete forward: %w", err)
-	}
-
-	// Delete status
-	if err := s.db.DeleteStatus(id); err != nil {
-		zap.L().Warn("Failed to delete status", zap.String("id", id), zap.Error(err))
 	}
 
 	zap.L().Info("Forward deleted from database", zap.String("id", id))

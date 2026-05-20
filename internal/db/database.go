@@ -73,9 +73,10 @@ func (d *Database) UpdateForward(forward *Forward) error {
 	return d.db.Save(forward).Error
 }
 
-// DeleteForward deletes a forward
+// DeleteForward deletes a forward using hard delete
+// Deprecated: Use DeleteForwardAndStatus for atomic deletion with status
 func (d *Database) DeleteForward(id string) error {
-	return d.db.Delete(&Forward{}, "id = ?", id).Error
+	return d.db.Unscoped().Delete(&Forward{}, "id = ?", id).Error
 }
 
 // CreateOrUpdateStatus creates or updates forward status
@@ -105,6 +106,20 @@ func (d *Database) DeleteStatus(forwardID string) error {
 	return d.db.Delete(&ForwardStatus{}, "forward_id = ?", forwardID).Error
 }
 
+// DeleteForwardAndStatus deletes both forward and its status in a transaction
+// Uses hard delete (Unscoped) to allow recreating the same forward
+func (d *Database) DeleteForwardAndStatus(id string) error {
+	return d.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Unscoped().Delete(&Forward{}, "id = ?", id).Error; err != nil {
+			return err
+		}
+		if err := tx.Delete(&ForwardStatus{}, "forward_id = ?", id).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 // CleanStatuses removes all status records
 func (d *Database) CleanStatuses() error {
 	return d.db.Exec("DELETE FROM forward_status").Error
@@ -127,9 +142,8 @@ type ForwardWithStatus struct {
 	ServiceAddr string         `gorm:"column:service_addr" json:"service_addr"`
 	MaxConns    int            `gorm:"column:max_conns" json:"max_conns"`
 	Description string         `gorm:"column:description" json:"description"`
-	CreatedAt   time.Time      `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt   time.Time      `gorm:"column:updated_at" json:"updated_at"`
-	DeletedAt   gorm.DeletedAt `gorm:"column:deleted_at" json:"-"`
+	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
 
 	// Status fields (from forward_status table, may be null)
 	Status        *string    `gorm:"column:status" json:"status,omitempty"`
@@ -150,7 +164,6 @@ func (fws *ForwardWithStatus) ToForward() Forward {
 		Description: fws.Description,
 		CreatedAt:   fws.CreatedAt,
 		UpdatedAt:   fws.UpdatedAt,
-		DeletedAt:   fws.DeletedAt,
 	}
 }
 
@@ -191,7 +204,6 @@ func (d *Database) ListForwardsWithStatus() ([]ForwardWithStatus, error) {
 			f.description,
 			f.created_at,
 			f.updated_at,
-			f.deleted_at,
 			fs.status,
 			fs.last_heartbeat,
 			fs.error_message

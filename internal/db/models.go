@@ -25,9 +25,8 @@ type Forward struct {
 	Description string `gorm:"size:500" json:"description"`
 
 	// Timestamps
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
-	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // ForwardType represents the type of forwarding

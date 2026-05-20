@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -173,5 +174,114 @@ func TestDatabase_TransactionRollback(t *testing.T) {
 	_, err = db2.GetForward("test-forward-3")
 	if err == nil {
 		t.Error("Expected forward to not exist due to rollback, but it was found")
+	}
+}
+
+// TestDatabase_DeleteForwardHardDelete tests that delete is hard delete (not soft delete)
+// and allows recreating the same forward
+func TestDatabase_DeleteForwardHardDelete(t *testing.T) {
+	dbFile := "test_hard_delete.db"
+	defer func() {
+		if err := os.Remove(dbFile); err != nil {
+			t.Logf("Failed to remove test database file: %v", err)
+		}
+	}()
+
+	database, err := New(Config{Path: dbFile})
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Logf("Failed to close database: %v", err)
+		}
+	}()
+
+	forward := &Forward{
+		ID:          "test-hard-delete-1",
+		Type:        LocalListenToRemote,
+		ListenHost:  "local",
+		ServiceHost: "remote",
+		ListenAddr:  "127.0.0.1:9090",
+		ServiceAddr: "127.0.0.1:9091",
+	}
+
+	status := &ForwardStatus{
+		ForwardID:     "test-hard-delete-1",
+		Status:        "pending",
+		LastHeartbeat: time.Now(),
+	}
+
+	// Create forward and status
+	err = database.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(forward).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(status).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to create forward: %v", err)
+	}
+
+	// Delete forward and status using new method
+	err = database.DeleteForwardAndStatus("test-hard-delete-1")
+	if err != nil {
+		t.Fatalf("Failed to delete forward: %v", err)
+	}
+
+	// Verify forward is completely removed (not soft-deleted)
+	_, err = database.GetForward("test-hard-delete-1")
+	if err == nil {
+		t.Fatal("Expected forward to be deleted, but it was found")
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("Expected ErrRecordNotFound, got: %v", err)
+	}
+
+	// Verify status is removed
+	_, err = database.GetStatus("test-hard-delete-1")
+	if err == nil {
+		t.Fatal("Expected status to be deleted, but it was found")
+	}
+
+	// Recreate the same forward - should succeed (no UNIQUE constraint error)
+	forward2 := &Forward{
+		ID:          "test-hard-delete-1",
+		Type:        LocalListenToRemote,
+		ListenHost:  "local",
+		ServiceHost: "remote",
+		ListenAddr:  "127.0.0.1:9090",
+		ServiceAddr: "127.0.0.1:9091",
+	}
+
+	status2 := &ForwardStatus{
+		ForwardID:     "test-hard-delete-1",
+		Status:        "pending",
+		LastHeartbeat: time.Now(),
+	}
+
+	err = database.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(forward2).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(status2).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to recreate forward after hard delete: %v", err)
+	}
+
+	// Verify recreated forward exists
+	retrieved, err := database.GetForward("test-hard-delete-1")
+	if err != nil {
+		t.Fatalf("Failed to retrieve recreated forward: %v", err)
+	}
+	if retrieved.ID != "test-hard-delete-1" {
+		t.Errorf("Expected ID 'test-hard-delete-1', got '%s'", retrieved.ID)
 	}
 }
