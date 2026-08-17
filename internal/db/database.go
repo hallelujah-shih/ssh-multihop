@@ -134,14 +134,14 @@ func (d *Database) Transaction(fn func(tx *gorm.DB) error) error {
 // This is a separate result struct for JOIN queries (not modifying Forward model)
 // We use embedded structs to avoid GORM relation confusion
 type ForwardWithStatus struct {
-	ForwardID   string         `gorm:"column:id" json:"id"`
-	Type        string         `gorm:"column:type" json:"type"`
-	ListenHost  string         `gorm:"column:listen_host" json:"listen_host"`
-	ServiceHost string         `gorm:"column:service_host" json:"service_host"`
-	ListenAddr  string         `gorm:"column:listen_addr" json:"listen_addr"`
-	ServiceAddr string         `gorm:"column:service_addr" json:"service_addr"`
-	MaxConns    int            `gorm:"column:max_conns" json:"max_conns"`
-	Description string         `gorm:"column:description" json:"description"`
+	ForwardID   string    `gorm:"column:id" json:"id"`
+	Type        string    `gorm:"column:type" json:"type"`
+	ListenHost  string    `gorm:"column:listen_host" json:"listen_host"`
+	ServiceHost string    `gorm:"column:service_host" json:"service_host"`
+	ListenAddr  string    `gorm:"column:listen_addr" json:"listen_addr"`
+	ServiceAddr string    `gorm:"column:service_addr" json:"service_addr"`
+	MaxConns    int       `gorm:"column:max_conns" json:"max_conns"`
+	Description string    `gorm:"column:description" json:"description"`
 	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
 	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
 
