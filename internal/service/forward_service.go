@@ -442,23 +442,7 @@ func (s *ForwardService) sync() {
 
 	s.mu.RLock()
 	for id, wrapper := range s.forwards {
-		var status forwarding.ForwardStatus
-		switch wrapper.Type {
-		case db.LocalListenToRemote:
-			if wrapper.LocalListenToRemote != nil {
-				status = wrapper.LocalListenToRemote.Status()
-			}
-		case db.RemoteListenToLocal:
-			if wrapper.RemoteListenToLocal != nil {
-				status = wrapper.RemoteListenToLocal.Status()
-			}
-		case db.RemoteListenToRemote:
-			if wrapper.RemoteListenToRemote != nil {
-				status = wrapper.RemoteListenToRemote.Status()
-			}
-		}
-
-		if status == forwarding.StatusError {
+		if wrapperStatus(wrapper) == forwarding.StatusError {
 			// Collect forwards to rebuild, process later
 			errorForwards = append(errorForwards, id)
 			errorForwardWrappers = append(errorForwardWrappers, wrapper)
@@ -586,7 +570,11 @@ func (s *ForwardService) ListForwards() ([]db.Forward, error) {
 	return s.db.ListForwards()
 }
 
-// GetStatus retrieves the status of a forward
+// GetStatus retrieves the status of a forward.
+//
+// The in-memory forward status is authoritative when the forward is loaded:
+// the database only records status transitions, so a healthy running forward
+// would otherwise show a stale last_heartbeat forever.
 func (s *ForwardService) GetStatus(id string) (*db.ForwardStatus, error) {
 	status, err := s.db.GetStatus(id)
 	if err != nil {
@@ -595,12 +583,61 @@ func (s *ForwardService) GetStatus(id string) (*db.ForwardStatus, error) {
 		}
 		return nil, err
 	}
+
+	s.mu.RLock()
+	w, live := s.forwards[id]
+	s.mu.RUnlock()
+	if live {
+		mergeLiveStatus(status, w)
+	}
 	return status, nil
 }
 
-// ListStatuses lists all forward statuses
+// ListStatuses lists all forward statuses, merged with in-memory state.
 func (s *ForwardService) ListStatuses() ([]db.ForwardStatus, error) {
-	return s.db.ListStatuses()
+	statuses, err := s.db.ListStatuses()
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.RLock()
+	for i := range statuses {
+		if w, live := s.forwards[statuses[i].ForwardID]; live {
+			mergeLiveStatus(&statuses[i], w)
+		}
+	}
+	s.mu.RUnlock()
+	return statuses, nil
+}
+
+// mergeLiveStatus overwrites a database status row with the authoritative
+// in-memory status of a loaded forward.
+func mergeLiveStatus(status *db.ForwardStatus, w ForwardWrapper) {
+	status.Status = wrapperStatus(w).String()
+	status.ErrorMessage = ""
+	if status.Status == "running" {
+		status.LastHeartbeat = time.Now()
+	}
+}
+
+// wrapperStatus returns the in-memory status of a forward wrapper,
+// or StatusStopped if the implementation is missing.
+func wrapperStatus(w ForwardWrapper) forwarding.ForwardStatus {
+	switch w.Type {
+	case db.LocalListenToRemote:
+		if w.LocalListenToRemote != nil {
+			return w.LocalListenToRemote.Status()
+		}
+	case db.RemoteListenToLocal:
+		if w.RemoteListenToLocal != nil {
+			return w.RemoteListenToLocal.Status()
+		}
+	case db.RemoteListenToRemote:
+		if w.RemoteListenToRemote != nil {
+			return w.RemoteListenToRemote.Status()
+		}
+	}
+	return forwarding.StatusStopped
 }
 
 // GetPoolStats returns current connection pool statistics
