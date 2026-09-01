@@ -47,9 +47,8 @@ make coverage           # Generate coverage report
 ## Running the Application
 
 ```bash
-./ssh-multihop list-hosts                                    # List SSH config hosts
-./ssh-multihop map --forward 127.0.0.1:8888@local --to 127.0.0.1:8888@vmr.u24
-./ssh-multihop daemon --port 8080                            # Start REST API
+./ssh-multihop daemon --port 8080                            # Start REST API daemon
+./ssh-multihop daemon --db /path/to/db                       # Custom SQLite path
 ```
 
 ## Code Style Guidelines
@@ -120,35 +119,40 @@ func setup() error {
 
 ### Forward Implementation Pattern
 ```go
-// Forwards: fail fast, update DB on error, no internal retry
-func (f *LocalListenToRemote) Start(ctx context.Context) error {
-    f.statusMu.Lock()
-    defer f.statusMu.Unlock()
-    
-    listener, err := net.Listen("tcp", f.bindAddr)
+// Forwards: fail fast, update DB on error, no internal retry.
+// Start returns after spawning goroutines; start failures set DB status and clean up partial resources.
+func (lf *LocalListenToRemote) Start(ctx context.Context) error {
+    innerCtx, cancel := context.WithCancel(ctx)
+    lf.cancelFunc = cancel
+
+    listener, err := net.Listen("tcp", lf.bindAddr)
     if err != nil {
-        f.setStatus(StatusError)
-        f.updateDBStatus("error", err.Error())
-        return fmt.Errorf("listen failed: %w", err)
+        return fmt.Errorf("failed to create listener: %w", err)
     }
-    
-    go f.healthCheckLoop()
-    f.setStatus(StatusRunning)
+    lf.listener = listener
+    lf.setStatus(StatusRunning)
+
+    lf.startHealthMonitoring(innerCtx)
+    go lf.acceptLoop(innerCtx)
+    go lf.cleanupMonitor(innerCtx)
     return nil
 }
 
-// Health check: simple, update DB on failure
-func (f *LocalListenToRemote) HealthCheck() error {
-    if f.status != StatusRunning {
-        return fmt.Errorf("not running")
+// Health check: observe pooled SSH connection state, no side effects on success
+func (lf *LocalListenToRemote) HealthCheck() error {
+    if lf.Status() != StatusRunning {
+        return fmt.Errorf("forward not running (status: %s)", lf.Status())
     }
-    if err := f.checkListener(); err != nil {
-        f.setStatus(StatusError)
-        f.updateDBStatus("error", err.Error())
-        return err
+    pooledConn, err := lf.pool.Acquire(ctx, lf.buildSignature(), lf.forwardID)
+    if err != nil {
+        return fmt.Errorf("failed to acquire connection for health check: %w", err)
     }
-    return nil
+    defer func() { _ = lf.pool.Release(pooledConn, lf.forwardID) }()
+    return lf.observeConnectionState(pooledConn.Client)
 }
+
+// Error paths call setErrorStatus (health-check failure also cancels the context);
+// cleanupMonitor (guarded by cleanupOnce) performs unified resource cleanup
 ```
 
 ### Testing Patterns
@@ -157,14 +161,11 @@ func (f *LocalListenToRemote) HealthCheck() error {
 import (
     "testing"
     "github.com/stretchr/testify/assert"
-    "github.com/stretchr/testify/require"
 )
 
 func TestLocalListenToRemote_BasicLifecycle(t *testing.T) {
     // Arrange
-    testDB, err := createTestDB()
-    require.NoError(t, err)
-    defer testDB.Close()
+    testDB := db.NewTestDB(t)
 
     // Act
     lf := NewLocalListenToRemote(...)
@@ -176,6 +177,8 @@ func TestLocalListenToRemote_BasicLifecycle(t *testing.T) {
     assert.NoError(t, lf.Stop())
 }
 ```
+
+Test convention: use `db.NewTestDB(t)` for an isolated in-memory SQLite DB (cleanup auto-registered); zap's global logger defaults to nop in tests — `internal/service` initializes it in `TestMain` (nop unless `DEBUG_TESTS=1`, see `internal/service/forward_service_test.go`).
 
 ### Concurrency and Cleanup
 ```go
@@ -220,6 +223,7 @@ logger.Error("Failed to start forward",
 ## Project Structure
 ```
 cmd/ssh-multihop/          # Main entry point
+cmd/passphrase-client/     # Passphrase socket test client
 internal/
 ├── agent/                # SSH agent implementation
 ├── api/                   # REST API handlers
@@ -244,7 +248,10 @@ Base: `http://localhost:8080/api/v1`
 - `GET /forwards` - List forwards
 - `GET /forwards/:id` - Get details
 - `DELETE /forwards/:id` - Delete forward
-- `GET /forwards/:id/status` - Get status
+- `GET /status/:id` - Get status
+- `GET /status` - List statuses
+- `GET /pool/stats` - Connection pool stats
+- `GET /health` - Health check (not under `/api/v1`)
 
 ## Common Pitfalls
 1. **Don't add retry logic in Forwards** - `ForwardService` handles rebuilds

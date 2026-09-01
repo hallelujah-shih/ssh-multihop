@@ -42,11 +42,7 @@ make coverage          # Generate coverage report
 ## Running the Application
 
 ```bash
-# CLI mode
-./ssh-multihop list-hosts                    # List all hosts from SSH config
-./ssh-multihop map --forward 127.0.0.1:8888@local --to 127.0.0.1:8888@vmr.u24
-
-# Daemon mode
+# Daemon mode (only command)
 ./ssh-multihop daemon --port 8080            # Start REST API on port 8080
 ./ssh-multihop daemon --port 8080 --db /path/to/db  # Custom database path
 ```
@@ -75,11 +71,11 @@ make coverage          # Generate coverage report
 The project implements a **simplified architecture** with clear separation of concerns:
 
 - **Forward Instances** (`internal/forwarding/`): Only handle connection establishment and health checking. Fail fast on errors without retry logic.
-- **ForwardService** (`internal/service/`): Manages lifecycle (creation, rebuild, deletion) of all forwards via a 5-second sync loop.
+- **ForwardService** (`internal/service/`): Manages lifecycle (creation, rebuild, deletion) of all forwards via a 10-second sync loop.
 
 Key principles:
 1. Forwards update database status to "error" on failure, then stop
-2. ForwardService detects error states from database and rebuilds with exponential retry (max 10 attempts, 3s delay)
+2. ForwardService detects error states from database and rebuilds with exponential backoff (1s base, 120s max)
 3. No self-healing logic inside Forward implementations
 4. Database is single source of truth for configuration
 
@@ -124,7 +120,8 @@ Key endpoints:
 - `GET /api/v1/forwards` - List all forwards
 - `GET /api/v1/forwards/:id` - Get forward details
 - `DELETE /api/v1/forwards/:id` - Delete forward
-- `GET /api/v1/forwards/:id/status` - Get forward status
+- `GET /api/v1/status/:id` - Get forward status
+- `GET /api/v1/pool/stats` - Get connection pool statistics
 
 See `docs/api/REFERENCE.md` for complete API documentation.
 
@@ -132,9 +129,9 @@ See `docs/api/REFERENCE.md` for complete API documentation.
 
 ### Forward Lifecycle
 
-1. Forward.Start() blocks until stopped or error
-2. Health check every 15 seconds
-3. On error: set DB status to "error", stop forward, return
+1. Forward.Start() returns after spawning accept/health/cleanup goroutines
+2. Health check every 15-30 seconds (random interval per forward)
+3. On error: set DB status to "error", cancel context (unified cleanup runs)
 4. ForwardService sync loop detects "error" status and rebuilds
 
 ### Resource Cleanup

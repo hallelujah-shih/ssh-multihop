@@ -27,23 +27,23 @@
 #### 1. 连接建立
 ```go
 func (f *Forward) Start(ctx context.Context) error {
-    // Establish SSH connections
+    // Establish SSH connections (via connection pool)
     // Create listener
     // Start health monitoring
-    // Block until stopped or error
+    // Spawn accept/cleanup goroutines, then return immediately
     return nil
 }
 ```
 
 **关键点：**
-- 阻塞直到停止或发生错误
+- 启动 goroutines 后立即返回；停止和错误由 context 取消驱动
 - 无重试逻辑 - 任何错误都快速失败
 - 启动失败时将数据库状态设置为 "error"
 
 #### 2. 健康监控
 ```go
 func (f *Forward) startHealthMonitoring(ctx context.Context) {
-    ticker := time.NewTicker(15 * time.Second)
+    ticker := time.NewTicker(f.healthCheckInterval) // RandomHealthCheckInterval(): 15-30s
     for {
         select {
         case <-ctx.Done():
@@ -52,8 +52,8 @@ func (f *Forward) startHealthMonitoring(ctx context.Context) {
             if err := f.HealthCheck(); err != nil {
                 // Set database status to error
                 f.setErrorStatus(err.Error())
-                // Stop forward
-                f.Stop()
+                // Cancel context; cleanupMonitor performs unified cleanup
+                f.cancelFunc()
                 return
             }
         }
@@ -62,8 +62,8 @@ func (f *Forward) startHealthMonitoring(ctx context.Context) {
 ```
 
 **关键点：**
-- 每 15 秒进行一次健康检查
-- 失败时：设置数据库状态为 "error"，停止 forward，返回
+- 每 15-30 秒（随机间隔）进行一次健康检查
+- 失败时：设置数据库状态为 "error"，取消 context 触发清理，返回
 - 不尝试自我修复
 
 #### 3. 资源清理
@@ -110,11 +110,11 @@ func (f *Forward) setErrorStatus(errorMsg string) {
 
 ### 同步循环
 
-ForwardService 每 5 秒运行一次同步循环以管理 forward 生命周期：
+ForwardService 每 10 秒运行一次同步循环以管理 forward 生命周期：
 
 ```go
 func (s *ForwardService) syncLoop(ctx context.Context) {
-    ticker := time.NewTicker(5 * time.Second)
+    ticker := time.NewTicker(10 * time.Second)
     for {
         select {
         case <-ctx.Done():
@@ -174,26 +174,18 @@ func (s *ForwardService) rebuildErrorForward(forwardID string, wrapper ForwardWr
     // Step 3: Get config from database
     dbForward, err := s.db.GetForward(forwardID)
 
-    // Step 4: Start new forward with retry
-    maxRetries := 10
-    retryDelay := 3 * time.Second
-
-    for attempt := 0; attempt < maxRetries; attempt++ {
-        if err := s.startForward(dbForward); err != nil {
-            if attempt == maxRetries-1 {
-                s.updateStatus(forwardID, "error", err.Error())
-                return
-            }
-            time.Sleep(retryDelay)
-            continue
-        }
-        return // Success
+    // Step 4: Start new forward (single attempt)
+    if err := s.startForward(dbForward); err != nil {
+        s.updateStatus(forwardID, "error", err.Error())
+        // 记录失败，sync loop 按指数退避推迟下次重建
+        s.recordRebuildFailure(forwardID)
+        return
     }
 }
 ```
 
 **关键点：**
-- 重建使用指数重试，有最大尝试次数
+- 单次 rebuild 只做一次尝试；重试由 sync loop 按指数退避调度（1s 基数，上限 120s）
 - 只有 ForwardService 重试，不是 Forward 实例
 - 数据库是配置的唯一真实来源
 
@@ -556,23 +548,11 @@ func (h *ForwardHandler) CreateForward(c *gin.Context) {
 
 ### 6. Daemon 模式安全
 
-**交互式认证禁用：** Daemon 模式下禁用交互式密码提示。
+**交互式认证禁用：** 应用只有 daemon 入口，config builder 恒为 daemon 模式（`isDaemon: true`），从不通过 stdin 交互式提示密码。
 
 ```go
-func isDaemonMode() bool {
-    for _, arg := range os.Args {
-        if arg == "daemon" {
-            return true
-        }
-    }
-    return false
-}
-
-// 在 SSH agent 中使用
-if isDaemonMode() {
-    // 禁用交互式提示
-    // 使用 SSH_AUTH_SOCK 或 passphrase socket
-}
+// internal/connection/builder.go
+isDaemon: true // Always daemon mode - no interactive stdin prompts
 ```
 
 **SSH Agent 自动检测：**
@@ -586,20 +566,7 @@ if socket != "" {
 
 ### 7. Passphrase Socket
 
-**用途：** 为 daemon 模式下的加密 SSH 密钥提供密码。
-
-```bash
-# 启动带 passphrase socket 的 daemon
-./ssh-multihop daemon --passphrase-socket /run/user/$UID/ssh-multihop/passphrase.sock
-
-# 为密钥发送密码
-echo "<fingerprint> <passphrase>" | ./passphrase-client /run/user/$UID/ssh-multihop/passphrase.sock
-```
-
-**安全特性：**
-- Socket 权限：0600（仅所有者读写）
-- 密码不在进程间传递
-- 适用于 systemd 服务
+**状态：特性当前不可用。** Daemon 会启动 passphrase socket，但 `passphrase-client` 只发送 passphrase，而服务端要求 "fingerprint passphrase" 格式（协议不匹配），且没有任何代码将 socket 注入 config builder，加密密钥的密码无法生效。
 
 ## 性能优化总结
 
@@ -713,9 +680,6 @@ func (cm *ConnectionManager) Acquire(
         // 增加引用计数
         conn.Acquire()
 
-        // 注册健康检查
-        cm.healthChecker.RegisterForward(conn, forwardID)
-
         return conn, nil
     }
 
@@ -761,9 +725,6 @@ func (cm *ConnectionManager) Release(
     conn *PooledConnection,
     forwardID string,
 ) error {
-    // 从健康检查中注销
-    cm.healthChecker.UnregisterForward(conn, forwardID)
-
     // 减少引用计数
     conn.Release()
 
@@ -797,27 +758,20 @@ func (cm *ConnectionManager) lingerAndClose(conn *PooledConnection) {
 
 ```go
 type HealthChecker struct {
-    // 连接 → [ForwardID] 映射
-    forwardRegistry map[string]*ForwardRegistry
-    interval        time.Duration // 15 秒
+    // 连接 → signature hash 映射
+    monitoredConnections map[string]*PooledConnection
+    config          HealthCheckConfig // Interval: 15 秒
 }
 
-func (hc *HealthChecker) Monitor(conn *PooledConnection) {
-    ticker := time.NewTicker(hc.interval)
+func (hc *HealthChecker) checkLoop() {
+    ticker := time.NewTicker(hc.config.Interval)
 
     for {
         select {
-        case <-conn.Context.Done():
-            return // 连接已关闭
         case <-ticker.C:
-            // 发送 keepalive 请求
-            ok := hc.sendKeepalive(conn.Client)
-            if !ok {
-                // 连接失败，取消上下文
-                // 所有使用此连接的 Forwards 将收到通知
-                conn.CancelFunc()
-                return
-            }
+            hc.checkAllConnections()
+        case <-hc.done:
+            return
         }
     }
 }
