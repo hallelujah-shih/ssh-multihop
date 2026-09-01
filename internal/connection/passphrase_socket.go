@@ -81,7 +81,11 @@ func (ps *PassphraseSocket) handleConnection(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
 	// Set read timeout (30 seconds)
-	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		zap.L().Warn("Failed to set read deadline on passphrase connection",
+			zap.Error(err))
+		return
+	}
 
 	// Read line: "<fingerprint> <passphrase>"
 	scanner := bufio.NewScanner(conn)

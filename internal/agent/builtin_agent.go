@@ -9,7 +9,6 @@ import (
 	xagent "github.com/xanzy/ssh-agent"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ssh"
-	sshagent "golang.org/x/crypto/ssh/agent"
 )
 
 // BuiltInAgent manages a pure Go SSH agent for the application.
@@ -133,17 +132,6 @@ func (a *BuiltInAgent) IsAvailable() bool {
 	return a.goAgent.IsAvailable()
 }
 
-// GetSocketPath returns the agent socket path.
-func (a *BuiltInAgent) GetSocketPath() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.goAgent != nil {
-		return a.goAgent.GetSocketPath()
-	}
-	return ""
-}
-
 // GetKeyCount returns the number of keys loaded.
 func (a *BuiltInAgent) GetKeyCount() int {
 	a.mu.Lock()
@@ -153,17 +141,6 @@ func (a *BuiltInAgent) GetKeyCount() int {
 		return a.goAgent.GetKeyCount()
 	}
 	return 0
-}
-
-// GetAgent returns the underlying agent for advanced usage.
-func (a *BuiltInAgent) GetAgent() sshagent.Agent {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.goAgent != nil {
-		return a.goAgent.GetAgent()
-	}
-	return nil
 }
 
 // CleanupOrphanedAgents is a no-op for pure Go agent.

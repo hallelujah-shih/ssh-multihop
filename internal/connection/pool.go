@@ -83,19 +83,12 @@ type ConnectionManager struct {
 	// healthChecker performs health checks on all active connections.
 	healthChecker *HealthChecker
 
-	// done signals the background cleanup goroutine to stop.
-	done chan struct{}
-
-	// wg waits for the background goroutine to finish.
-	wg sync.WaitGroup
-
 	// closeOnce ensures Close() is idempotent.
 	closeOnce sync.Once
 }
 
 // NewConnectionManager creates a new ConnectionManager with the given config.
-// It starts a background goroutine for cleanup of idle connections and initializes
-// the health checker.
+// It initializes the health checker for pooled connections.
 //
 // The hopConfigProvider is called when creating a new connection. It should return
 // the hop configuration and SSH client config builder for the given signature.
@@ -112,46 +105,14 @@ func NewConnectionManager(config PoolConfig, hopConfigProvider HopConfigProvider
 		config:            config,
 		hopConfigProvider: hopConfigProvider,
 		healthChecker:     healthChecker,
-		done:              make(chan struct{}),
 	}
-
-	// Start background cleanup goroutine
-	cm.wg.Add(1)
-	go cm.cleanupLoop()
 
 	return cm
-}
-
-// cleanupLoop runs in the background, periodically checking for and removing
-// idle connections that have exceeded the timeout.
-func (cm *ConnectionManager) cleanupLoop() {
-	defer cm.wg.Done()
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			cm.cleanupIdleConnections()
-		case <-cm.done:
-			return
-		}
-	}
-}
-
-// cleanupIdleConnections removes idle connections that have exceeded the timeout.
-func (cm *ConnectionManager) cleanupIdleConnections() {
-	// TODO: Implement in Task 2.3 with lingering logic
-	// For now, this is a placeholder
 }
 
 // Acquire gets or creates a connection for the given signature.
 // If a connection exists in the pool, it increments the ref count and returns it.
 // Otherwise, it creates a new connection using the hopConfigProvider.
-//
-// The forwardID is used to register the forward with the health checker, so that
-// if the connection fails, all affected forwards can be notified via context cancellation.
 //
 // The context is used for cancellation during connection establishment.
 //
@@ -220,9 +181,6 @@ func (cm *ConnectionManager) Acquire(ctx context.Context, sig ConnectionSignatur
 				return nil, fmt.Errorf("failed to acquire existing connection: %w", err)
 			}
 
-			// Register forward with health checker
-			cm.healthChecker.RegisterForward(conn, forwardID)
-
 			return conn, nil
 		}
 	}
@@ -284,9 +242,6 @@ func (cm *ConnectionManager) Acquire(ctx context.Context, sig ConnectionSignatur
 		}
 	}
 
-	// Register forward with health checker
-	cm.healthChecker.RegisterForward(pooledConn, forwardID)
-
 	return pooledConn, nil
 }
 
@@ -311,8 +266,6 @@ func (cm *ConnectionManager) acquirePartial(ctx context.Context, sig ConnectionS
 	if err := conn.Acquire(); err != nil {
 		return nil, fmt.Errorf("failed to acquire partial connection: %w", err)
 	}
-
-	cm.healthChecker.RegisterForward(conn, forwardID)
 
 	return conn, nil
 }
@@ -388,12 +341,7 @@ func (cm *ConnectionManager) dialSSH(ctx context.Context, sig ConnectionSignatur
 // It decrements the ref count and marks the connection as idle if count reaches 0.
 // If the reference count reaches zero, a lingering timer is started to recycle
 // the connection after the configured idle timeout.
-//
-// The forwardID is used to unregister the forward from the health checker.
 func (cm *ConnectionManager) Release(conn *PooledConnection, forwardID string) error {
-	// Unregister forward from health checker
-	cm.healthChecker.UnregisterForward(conn, forwardID)
-
 	// Decrement reference count
 	if err := conn.Release(); err != nil {
 		return err
@@ -510,16 +458,12 @@ func (cm *ConnectionManager) isConnectionAlive(conn *PooledConnection) bool {
 	}
 }
 
-// Close closes all connections in the pool and stops the background goroutine.
+// Close closes all connections in the pool and stops the health checker.
 // This method is idempotent - calling it multiple times is safe.
 // CRITICAL: Closes ALL clients in hop chains (including intermediate hops) to prevent leaks.
 func (cm *ConnectionManager) Close() error {
 	var err error
 	cm.closeOnce.Do(func() {
-		// Signal background goroutine to stop
-		close(cm.done)
-		cm.wg.Wait()
-
 		// Close all connections
 		cm.mu.Lock()
 		defer cm.mu.Unlock()

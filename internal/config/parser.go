@@ -1,10 +1,7 @@
 package config
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -370,64 +367,4 @@ func (p *Parser) ListHosts() ([]*HostInfo, error) {
 	}
 
 	return result, nil
-}
-
-// CalculateFileChecksum calculates SHA256 checksum of a file
-func CalculateFileChecksum(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-
-	hash := sha256.Sum256(data)
-	return hex.EncodeToString(hash[:]), nil
-}
-
-// ResolveHost resolves hostname to IP address following SSH resolution order:
-// 1. Special case: "local" → 127.0.0.1
-// 2. SSH config lookup
-// 3. DNS fallback
-func ResolveHost(hostname string) (string, error) {
-	// 1. Special handling
-	if hostname == "local" {
-		return "127.0.0.1", nil
-	}
-
-	// 2. SSH config priority
-	homeDir, err := util.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("failed to get home directory: %w", err)
-	}
-	configPath := filepath.Join(homeDir, ".ssh", "config")
-
-	parser := NewParser()
-	_, err = parser.ParseConfig(configPath)
-	if err != nil {
-		// If SSH config doesn't exist, skip to DNS
-		return resolveByDNS(hostname)
-	}
-
-	// Try to get HostName from SSH config
-	hostConfig, err := parser.GetHostConfig(hostname)
-	if err == nil && hostConfig.HostName != "" {
-		// Use the HostName from SSH config
-		hostname = hostConfig.HostName
-	}
-
-	// 3. DNS resolution
-	return resolveByDNS(hostname)
-}
-
-// resolveByDNS performs DNS lookup and returns the first IP address
-func resolveByDNS(hostname string) (string, error) {
-	ips, err := net.LookupHost(hostname)
-	if err != nil {
-		return "", fmt.Errorf("DNS resolution failed for '%s': %w", hostname, err)
-	}
-
-	if len(ips) == 0 {
-		return "", fmt.Errorf("no IPs found for host '%s'", hostname)
-	}
-
-	return ips[0], nil
 }

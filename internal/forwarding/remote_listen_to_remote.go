@@ -47,7 +47,6 @@ type RemoteListenToRemote struct {
 	statusMu    sync.RWMutex
 	cancelFunc  context.CancelFunc
 	wg          sync.WaitGroup
-	ctx         context.Context
 	cleanupOnce sync.Once // Ensure resources are only cleaned up once
 
 	// Connection management - uses connection pool
@@ -57,7 +56,6 @@ type RemoteListenToRemote struct {
 	listener         net.Listener                  // Listener on source host for accepting connections
 	connMap          map[net.Conn]struct{}         // Track active connections for clean shutdown
 	connMu           sync.RWMutex                  // Protects connMap
-	passphraseSocket interface{}                   // For SSH key passphrase retrieval
 
 	// Configuration
 	maxConns int
@@ -163,7 +161,6 @@ func (inf *RemoteListenToRemote) Start(ctx context.Context) error {
 
 	// Create cancellable context
 	innerCtx, cancel := context.WithCancel(ctx)
-	inf.ctx = innerCtx
 	inf.cancelFunc = cancel
 	defer func() {
 		if inf.Status() != StatusRunning {
@@ -641,11 +638,6 @@ func (inf *RemoteListenToRemote) startHealthMonitoring(ctx context.Context) {
 
 // Removed: attemptRepair, reconnect, monitorListenerHealth, and calculateBackoff methods
 // Rebuild logic is now handled by ForwardService
-
-// SetPassphraseSocket sets the passphrase socket for retrieving SSH key passphrases
-func (inf *RemoteListenToRemote) SetPassphraseSocket(ps interface{}) {
-	inf.passphraseSocket = ps
-}
 
 // buildListenSignature creates a ConnectionSignature for the listener endpoint (source)
 // The listener is created on the source host, where connections come FROM

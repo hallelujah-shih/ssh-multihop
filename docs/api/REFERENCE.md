@@ -59,7 +59,6 @@ Create a new port forwarding rule.
   "listen_addr": "127.0.0.1:8888",
   "service_host": "vmr.u24",
   "service_addr": "127.0.0.1:8888",
-  "status": "running",
   "created_at": "2026-03-15T10:00:00Z"
 }
 ```
@@ -110,7 +109,6 @@ List all port forwarding rules.
     "listen_addr": "127.0.0.1:8888",
     "service_host": "vmr.u24",
     "service_addr": "127.0.0.1:8888",
-    "status": "running",
     "created_at": "2026-03-15T10:00:00Z"
   },
   {
@@ -120,7 +118,6 @@ List all port forwarding rules.
     "listen_addr": ":4000",
     "service_host": "local",
     "service_addr": "127.0.0.1:4000",
-    "status": "running",
     "created_at": "2026-03-15T10:05:00Z"
   }
 ]
@@ -148,7 +145,6 @@ Get details of a specific forward.
   "listen_addr": "127.0.0.1:8888",
   "service_host": "vmr.u24",
   "service_addr": "127.0.0.1:8888",
-  "status": "running",
   "max_conns": 0,
   "description": "Forward description",
   "created_at": "2026-03-15T10:00:00Z",
@@ -188,7 +184,7 @@ Delete a port forwarding rule.
 
 ### Get Forward Status
 
-**GET** `/api/v1/forwards/:id/status`
+**GET** `/api/v1/status/:id`
 
 Get the current status of a forward.
 
@@ -199,15 +195,53 @@ Get the current status of a forward.
   "status": "running",
   "last_heartbeat": "2026-03-15T10:30:00Z",
   "error_message": "",
-  "active_connections": 3
+  "created_at": "2026-03-15T10:00:00Z",
+  "updated_at": "2026-03-15T10:30:00Z"
 }
 ```
 
 **Error Response (404):**
 ```json
 {
-  "error": "Forward status not found",
+  "error": "Status not found",
   "code": "NOT_FOUND"
+}
+```
+
+---
+
+### List Forward Statuses
+
+**GET** `/api/v1/status`
+
+List statuses of all forwards. Response is an array of the status objects shown in Get Forward Status.
+
+---
+
+### Connection Pool Stats
+
+**GET** `/api/v1/pool/stats`
+
+**Response:**
+```json
+{
+  "total_connections": 3,
+  "active_connections": 1,
+  "idle_connections": 2,
+  "closed_connections": 0
+}
+```
+
+---
+
+### Health Check
+
+**GET** `/health` (not under `/api/v1`)
+
+**Response:**
+```json
+{
+  "status": "healthy"
 }
 ```
 
@@ -333,7 +367,6 @@ Use `:4000` to bind to all interfaces (`0.0.0.0:4000`)
 | `local_listen_to_remote` | `LocalListenToRemote` | SSH -L forwarding |
 | `remote_listen_to_local` | `RemoteListenToLocal` | SSH -R forwarding |
 | `remote_listen_to_remote` | `RemoteListenToRemote` | Remote-to-remote bridge |
-| (via orchestrator) | `InlineForwardOrchestrator` | UDS-based composition |
 
 ### Service Layer Recovery
 
@@ -342,16 +375,16 @@ The system implements **simplified architecture** where:
 1. **Forward instances** only handle connection and health checking
 2. **ForwardService** manages lifecycle (creation, rebuild, deletion)
 3. Forwards fail fast on errors and set database status to `"error"`
-4. Service layer sync loop (every 5s) detects and rebuilds error forwards
+4. Service layer sync loop (every 10s) detects and rebuilds error forwards
 
 See [architecture.md](../architecture.md) for details.
 
 ### Auto-Recovery
 
 - Forwards are automatically rebuilt when they encounter errors
-- Rebuild uses exponential retry (max 10 attempts, 3s delay)
+- Rebuild uses exponential backoff (1s base, 120s max)
 - Database is single source of truth for configuration
-- Health checks run every 15 seconds
+- Health checks run every 15-30 seconds (random interval)
 
 ---
 

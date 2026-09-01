@@ -41,16 +41,14 @@ type RemoteListenToLocal struct {
 	listener    net.Listener
 	cancelFunc  context.CancelFunc
 	wg          sync.WaitGroup
-	ctx         context.Context
 	cleanupOnce sync.Once // Ensure resources are only cleaned up once
 
 	// Connection management - uses connection pool
-	pool             *connection.ConnectionManager // Connection pool for SSH connections
-	hopChain         []*tunnel.HopConfig
-	pooledConn       *connection.PooledConnection // Active pooled connection for this forward
-	activeConns      map[net.Conn]struct{}        // Track active connections for clean shutdown
-	connMu           sync.RWMutex                 // Protects activeConns
-	passphraseSocket interface{}                  // For SSH key passphrase retrieval
+	pool        *connection.ConnectionManager // Connection pool for SSH connections
+	hopChain    []*tunnel.HopConfig
+	pooledConn  *connection.PooledConnection // Active pooled connection for this forward
+	activeConns map[net.Conn]struct{}        // Track active connections for clean shutdown
+	connMu      sync.RWMutex                 // Protects activeConns
 
 	// UDS support - when set, dial UDS instead of TCP
 	udsPath string
@@ -148,7 +146,6 @@ func (rf *RemoteListenToLocal) Start(ctx context.Context) error {
 
 	// Create cancellable context
 	innerCtx, cancel := context.WithCancel(ctx)
-	rf.ctx = innerCtx
 	rf.cancelFunc = cancel
 	defer func() {
 		if rf.Status() != StatusRunning {
@@ -593,11 +590,6 @@ func (rf *RemoteListenToLocal) startHealthMonitoring(ctx context.Context) {
 
 // Removed: attemptRepair, reconnect, and calculateBackoff methods
 // Rebuild logic is now handled by ForwardService
-
-// SetPassphraseSocket sets the passphrase socket for retrieving SSH key passphrases
-func (rf *RemoteListenToLocal) SetPassphraseSocket(ps interface{}) {
-	rf.passphraseSocket = ps
-}
 
 // buildSignature creates a ConnectionSignature from the hop chain
 func (rf *RemoteListenToLocal) buildSignature() connection.ConnectionSignature {

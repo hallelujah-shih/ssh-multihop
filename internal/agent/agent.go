@@ -118,12 +118,6 @@ func (a *GoAgent) Stop() error {
 	return nil
 }
 
-// GetSocketPath returns a placeholder identifier for the in-memory agent.
-// This is only used for logging/debugging purposes.
-func (a *GoAgent) GetSocketPath() string {
-	return "in-memory"
-}
-
 // GetKeyCount returns the number of keys loaded in the agent.
 func (a *GoAgent) GetKeyCount() int {
 	return a.memoryAgent.GetKeyCount()

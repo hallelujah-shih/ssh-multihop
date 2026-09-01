@@ -268,36 +268,10 @@ func TestRemoteListenToRemote_SingleHop(t *testing.T) {
 	assert.Empty(t, sig.JumpChain, "Single hop should have empty jump chain")
 }
 
-// TestRemoteListenToRemote_SetPassphraseSocket verifies passphrase socket setter
-func TestRemoteListenToRemote_SetPassphraseSocket(t *testing.T) {
-	fwd := NewRemoteListenToRemote(
-		"127.0.0.1:11434",
-		"vmr.u24",
-		11434,
-		nil,
-		"127.0.0.1:11434",
-		"dc4",
-		11434,
-		nil,
-		"test-id",
-		nil,
-		nil,
-		0,
-	)
-
-	ps := "test-socket"
-	fwd.SetPassphraseSocket(ps)
-	assert.Equal(t, ps, fwd.passphraseSocket)
-}
-
 // TestRemoteListenToRemote_WithDatabase verifies database status updates
 func TestRemoteListenToRemote_WithDatabase(t *testing.T) {
 	// Create in-memory database
-	testDB, err := db.New(db.Config{
-		Path: ":memory:",
-	})
-	require.NoError(t, err)
-	defer func() { _ = testDB.Close() }()
+	testDB := db.NewTestDB(t)
 
 	fwd := NewRemoteListenToRemote(
 		"127.0.0.1:11434",

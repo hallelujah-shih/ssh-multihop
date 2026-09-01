@@ -3,11 +3,9 @@ package connection
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/user"
 	"sync"
-	"time"
 
 	agentpkg "github.com/hallelujah-shih/ssh-multihop/internal/agent"
 	"github.com/hallelujah-shih/ssh-multihop/internal/tunnel"
@@ -20,19 +18,10 @@ import (
 // SSHClientConfigBuilder builds SSH client configurations from hop configurations.
 // SSHClientConfigBuilder builds SSH client configurations from hop configurations.
 type SSHClientConfigBuilder struct {
-	mu                sync.Mutex
-	customAgent       sshAgent
-	agentEnabled      bool
-	sshDir            string // Custom SSH directory for keys and certificates
-	keepaliveInterval time.Duration
-	keepaliveTimeout  time.Duration
-	isDaemon          bool // Running in daemon mode (no TTY)
-	passphraseSocket  *PassphraseSocket
-}
-
-// sshAgent interface to allow mocking in tests
-type sshAgent interface {
-	Signers() ([]ssh.Signer, error)
+	mu               sync.Mutex
+	agentEnabled     bool
+	isDaemon         bool // Running in daemon mode (no TTY)
+	passphraseSocket *PassphraseSocket
 }
 
 // NewSSHClientConfigBuilder creates a new SSH client config builder.
@@ -60,34 +49,6 @@ func NewSSHClientConfigBuilder() *SSHClientConfigBuilder {
 	}
 
 	return builder
-}
-
-// SetAgent sets a custom SSH agent (useful for testing).
-func (b *SSHClientConfigBuilder) SetAgent(customAgent sshAgent) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.customAgent = customAgent
-}
-
-// DisableAgent disables SSH agent integration.
-func (b *SSHClientConfigBuilder) DisableAgent() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.agentEnabled = false
-}
-
-// SetSSHDir sets the custom SSH directory for loading keys and certificates.
-func (b *SSHClientConfigBuilder) SetSSHDir(dir string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.sshDir = dir
-}
-
-// GetSSHDir returns the configured SSH directory.
-func (b *SSHClientConfigBuilder) GetSSHDir() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.sshDir
 }
 
 // SetPassphraseSocket sets the passphrase socket for retrieving SSH key passphrases.
@@ -180,18 +141,14 @@ func (b *SSHClientConfigBuilder) buildAuthMethods(hop *tunnel.HopConfig) ([]ssh.
 	// Note: Certificates require SSH agent and won't be loaded here
 	// Important: Try ALL available keys since different hosts may require different keys
 	if len(authMethods) == 0 {
-		// Determine SSH directory to use
-		sshDir := b.sshDir
-		if sshDir == "" {
-			// Use util.UserHomeDir() for setuidgid compatibility
-			// This queries the passwd database based on effective UID
-			homeDir, err := util.UserHomeDir()
-			if err != nil {
-				// Fallback to environment variable (may be wrong in setuidgid)
-				homeDir = os.Getenv("HOME")
-			}
-			sshDir = fmt.Sprintf("%s/.ssh", homeDir)
+		// Use util.UserHomeDir() for setuidgid compatibility
+		// This queries the passwd database based on effective UID
+		homeDir, err := util.UserHomeDir()
+		if err != nil {
+			// Fallback to environment variable (may be wrong in setuidgid)
+			homeDir = os.Getenv("HOME")
 		}
+		sshDir := fmt.Sprintf("%s/.ssh", homeDir)
 
 		zap.L().Debug("No auth methods from IdentityFile, trying default keys",
 			zap.String("hop", hop.Host),
@@ -234,14 +191,6 @@ func (b *SSHClientConfigBuilder) buildAuthMethods(hop *tunnel.HopConfig) ([]ssh.
 
 // trySSHAgent attempts to use ssh-agent for authentication.
 func (b *SSHClientConfigBuilder) trySSHAgent() (ssh.AuthMethod, error) {
-	// Use custom agent if set (for testing)
-	if b.customAgent != nil {
-		zap.L().Info("Using custom SSH agent (for testing)")
-		return ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
-			return b.customAgent.Signers()
-		}), nil
-	}
-
 	// Debug: Log SSH_AUTH_SOCK at trySSHAgent() call time
 	sshAuthSock := os.Getenv("SSH_AUTH_SOCK")
 	zap.L().Debug("trySSHAgent: Checking SSH_AUTH_SOCK",
@@ -420,26 +369,11 @@ func (b *SSHClientConfigBuilder) parsePrivateKeyWithPassphrase(keyPath string) (
 			}
 		}
 
-		// Skip interactive prompts in daemon mode
-		if b.isDaemon {
-			zap.L().Warn("Cannot prompt for passphrase in daemon mode",
-				zap.String("key", keyPath),
-				zap.String("hint", "Use ssh-agent or unencrypted keys"))
-			return nil, fmt.Errorf("key requires passphrase but running in daemon mode: %s", keyPath)
-		}
-
-		passphrase, err := b.promptForPassphrase(os.Stderr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get passphrase: %w", err)
-		}
-
-		// Try parsing with passphrase
-		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, passphrase)
-		if err != nil {
-			return nil, fmt.Errorf("incorrect passphrase or invalid key: %w", err)
-		}
-
-		return signer, nil
+		// No interactive prompts in daemon mode
+		zap.L().Warn("Cannot prompt for passphrase in daemon mode",
+			zap.String("key", keyPath),
+			zap.String("hint", "Use ssh-agent or unencrypted keys"))
+		return nil, fmt.Errorf("key requires passphrase but running in daemon mode: %s", keyPath)
 	}
 
 	// Some other parsing error
@@ -447,45 +381,4 @@ func (b *SSHClientConfigBuilder) parsePrivateKeyWithPassphrase(keyPath string) (
 		zap.String("key", keyPath),
 		zap.Error(err))
 	return nil, fmt.Errorf("failed to parse private key: %w", err)
-}
-
-// promptForPassphrase prompts the user for a passphrase via stdin.
-func (b *SSHClientConfigBuilder) promptForPassphrase(out interface{ WriteString(string) (int, error) }) ([]byte, error) {
-	// Display prompt to the user
-	_, err := out.WriteString("Enter passphrase for key: ")
-	if err != nil {
-		return nil, fmt.Errorf("failed to write prompt: %w", err)
-	}
-
-	// Read passphrase from stdin
-	var passphrase string
-	_, err = fmt.Scanln(&passphrase)
-	if err != nil {
-		// Handle EOF (e.g., when input is piped)
-		if errors.Is(err, io.EOF) {
-			return nil, errors.New("no passphrase provided (EOF)")
-		}
-		return nil, fmt.Errorf("failed to read passphrase: %w", err)
-	}
-
-	return []byte(passphrase), nil
-}
-
-// Keepalive configuration methods
-
-// SetKeepalive sets the keepalive interval and timeout for SSH connections.
-// Interval is how often to send keepalive messages.
-// Timeout is how long to wait for a response to a keepalive message.
-func (b *SSHClientConfigBuilder) SetKeepalive(interval, timeout time.Duration) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.keepaliveInterval = interval
-	b.keepaliveTimeout = timeout
-}
-
-// GetKeepalive returns the configured keepalive interval and timeout.
-func (b *SSHClientConfigBuilder) GetKeepalive() (interval, timeout time.Duration) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.keepaliveInterval, b.keepaliveTimeout
 }

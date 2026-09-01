@@ -1,16 +1,11 @@
 package forwarding
 
 import (
-	"context"
-	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"time"
 )
-
-// CleanupFunc is a function that cleans up resources
-type CleanupFunc func()
 
 // RandomHealthCheckInterval generates a random health check interval between 15-30 seconds
 // This prevents "thundering herd" problem where all forwards check health simultaneously
@@ -61,40 +56,6 @@ func bidirectionalCopy(conn1, conn2 net.Conn) error {
 	// Wait for first direction to complete
 	// The deferred Close() calls ensure cleanup happens
 	return <-errCh
-}
-
-// waitForHealthCheck waits for a forward to become healthy
-//
-// This is used by StartAndWait to poll the status of a forward
-// until it reaches Running state or times out.
-func waitForHealthCheck(ctx context.Context, forward Forward, timeout time.Duration) error {
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	consecutiveRunningChecks := 0
-
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			return fmt.Errorf("timeout waiting for forward %s to establish", forward.String())
-
-		case <-ticker.C:
-			status := forward.Status()
-			if status == StatusRunning {
-				consecutiveRunningChecks++
-				// Require 3 consecutive running checks (300ms) to ensure stability
-				if consecutiveRunningChecks >= 3 {
-					return nil
-				}
-			} else {
-				// StatusStopped or StatusError - reset counter
-				consecutiveRunningChecks = 0
-			}
-		}
-	}
 }
 
 // isNormalCloseError checks if an error represents a normal connection closure.

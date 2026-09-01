@@ -51,7 +51,10 @@ func main() {
 	defer func() { _ = conn.Close() }()
 
 	// Send passphrase (fingerprint will be provided by server based on key)
-	_, _ = fmt.Fprintf(conn, "%s\n", passphrase)
+	if _, err := fmt.Fprintf(conn, "%s\n", passphrase); err != nil {
+		fmt.Fprintf(os.Stderr, "Error sending passphrase: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Read response
 	response, err := bufio.NewReader(conn).ReadString('\n')

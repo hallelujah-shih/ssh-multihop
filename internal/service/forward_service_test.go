@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hallelujah-shih/ssh-multihop/internal/db"
+	"github.com/hallelujah-shih/ssh-multihop/internal/tunnel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -15,29 +16,12 @@ import (
 
 // setupTestDB creates an in-memory SQLite database for testing
 func setupTestDB(t *testing.T) *db.Database {
-	// Use unique in-memory database for each test to avoid conflicts
-	// Each test gets its own database to ensure proper isolation
-	cfg := db.Config{
-		Path: fmt.Sprintf("file:test-%d.db?cache=shared&mode=memory", time.Now().UnixNano()),
-	}
-	database, err := db.New(cfg)
-	require.NoError(t, err)
-
-	// Register cleanup function to delete the database file when test completes
-	t.Cleanup(func() {
-		if err := database.Close(); err != nil {
-			t.Logf("Failed to close test database: %v", err)
-		}
-		// No need to delete file as it's in-memory
-	})
-
-	return database
+	return db.NewTestDB(t)
 }
 
-// setupTestLogger initializes zap logger for tests
-func setupTestLogger() {
-	// Initialize test logger with minimal output to keep tests clean
-	// Use nop logger by default - tests can override with DEBUG_TESTS=1 if needed
+// TestMain initializes the zap logger for the whole test binary.
+// Set DEBUG_TESTS=1 for a development logger instead of a no-op.
+func TestMain(m *testing.M) {
 	if os.Getenv("DEBUG_TESTS") == "1" {
 		logger, err := zap.NewDevelopment()
 		if err != nil {
@@ -45,14 +29,13 @@ func setupTestLogger() {
 		}
 		zap.ReplaceGlobals(logger)
 	} else {
-		// Use no-op logger for normal test runs - silent but functional
 		zap.ReplaceGlobals(zap.NewNop())
 	}
+	os.Exit(m.Run())
 }
 
 // TestForwardService_New tests creating a new ForwardService
 func TestForwardService_New(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 
 	service, err := New(database)
@@ -70,7 +53,6 @@ func TestForwardService_New(t *testing.T) {
 
 // TestForwardService_CreateForward tests creating a valid forward
 func TestForwardService_CreateForward(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -102,7 +84,6 @@ func TestForwardService_CreateForward(t *testing.T) {
 
 // TestForwardService_CreateForward_InvalidAddress tests validation of invalid addresses
 func TestForwardService_CreateForward_InvalidAddress(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -153,9 +134,9 @@ func TestForwardService_CreateForward_InvalidAddress(t *testing.T) {
 				ServiceHost: "dc4",
 				ListenAddr:  "127.0.0.1:11434",
 				ServiceAddr: "127.0.0.1:11434",
-				MaxConns:    10, // not supported for inline forward
+				MaxConns:    10, // not supported for remote_listen_to_remote
 			},
-			expectError: "inline forward does not support maxConns",
+			expectError: "remote_listen_to_remote does not support maxConns parameter",
 		},
 	}
 
@@ -170,7 +151,6 @@ func TestForwardService_CreateForward_InvalidAddress(t *testing.T) {
 
 // TestForwardService_ListForwards tests listing all forwards
 func TestForwardService_ListForwards(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -216,7 +196,6 @@ func TestForwardService_ListForwards(t *testing.T) {
 
 // TestForwardService_GetForward tests retrieving a specific forward
 func TestForwardService_GetForward(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -246,7 +225,6 @@ func TestForwardService_GetForward(t *testing.T) {
 
 // TestForwardService_DeleteForward tests deleting a forward
 func TestForwardService_DeleteForward(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -277,7 +255,6 @@ func TestForwardService_DeleteForward(t *testing.T) {
 
 // TestForwardService_GetStatus tests retrieving forward status
 func TestForwardService_GetStatus(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -316,7 +293,6 @@ func TestForwardService_GetStatus(t *testing.T) {
 
 // TestForwardService_ListStatuses tests listing all statuses
 func TestForwardService_ListStatuses(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -360,7 +336,6 @@ func TestForwardService_ListStatuses(t *testing.T) {
 
 // TestForwardService_Start tests starting the service
 func TestForwardService_Start(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -398,7 +373,6 @@ func TestForwardService_Start(t *testing.T) {
 
 // TestForwardService_Start_EmptyDatabase tests starting service with empty database
 func TestForwardService_Start_EmptyDatabase(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -415,7 +389,6 @@ func TestForwardService_Start_EmptyDatabase(t *testing.T) {
 
 // TestForwardService_ShouldRebuild tests exponential backoff calculation
 func TestForwardService_ShouldRebuild(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -478,7 +451,6 @@ func TestForwardService_ShouldRebuild(t *testing.T) {
 
 // TestForwardService_CalculateBackoff tests backoff calculation
 func TestForwardService_CalculateBackoff(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -509,7 +481,6 @@ func TestForwardService_CalculateBackoff(t *testing.T) {
 
 // TestForwardService_RecordRebuildFailure tests failure recording
 func TestForwardService_RecordRebuildFailure(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -535,7 +506,6 @@ func TestForwardService_RecordRebuildFailure(t *testing.T) {
 
 // TestForwardService_RecordRebuildSuccess tests success recording
 func TestForwardService_RecordRebuildSuccess(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -560,7 +530,6 @@ func TestForwardService_RecordRebuildSuccess(t *testing.T) {
 
 // TestForwardService_UpdateStatus tests status updates
 func TestForwardService_UpdateStatus(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -589,7 +558,6 @@ func TestForwardService_UpdateStatus(t *testing.T) {
 
 // TestForwardService_Stop tests stopping the service
 func TestForwardService_Stop(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -621,7 +589,6 @@ func TestForwardService_Stop(t *testing.T) {
 
 // TestForwardService_ConcurrentAccess tests concurrent access to service methods
 func TestForwardService_ConcurrentAccess(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -678,13 +645,34 @@ func TestForwardService_ConcurrentAccess(t *testing.T) {
 	assert.True(t, true)
 }
 
+// waitFor polls cond until it returns true or the timeout elapses.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("condition not met within timeout")
+}
+
 // TestPendingStartsPreventsRace verifies that pendingStarts mechanism prevents
 // duplicate forward creation when sync() is called concurrently
 func TestPendingStartsPreventsRace(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
+	t.Cleanup(service.cancel)
+
+	// Block hop resolution so the start attempt stays inside pendingStarts
+	// for the whole assertion window (no sleep race against SSH config parsing).
+	release := make(chan struct{})
+	service.hopResolver = func(host string) ([]*tunnel.HopConfig, error) {
+		<-release
+		return nil, fmt.Errorf("resolution blocked by test")
+	}
 
 	// Create test forward with invalid host to prevent actual connection
 	testForward := &db.Forward{
@@ -700,55 +688,45 @@ func TestPendingStartsPreventsRace(t *testing.T) {
 	}
 
 	// Simulate 5 concurrent sync() calls
-	// This tests the race condition where slow SSH handshake could cause
-	// duplicate forwards to be created
 	var wg sync.WaitGroup
-	numConcurrentCalls := 5
-
-	// Use a channel to signal when all sync calls have been initiated
-	syncInitiated := make(chan struct{})
-
-	for i := 0; i < numConcurrentCalls; i++ {
+	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			service.sync()
-			<-syncInitiated // Signal that this sync call has completed
 		}()
 	}
 
-	// Wait a tiny bit to ensure at least one sync() has started and added the forward to pendingStarts
-	// Then check pendingStarts before any sync() calls complete
-	time.Sleep(1 * time.Millisecond)
+	// Exactly one start attempt should be registered and held in pendingStarts
+	waitFor(t, 2*time.Second, func() bool {
+		service.pendingMu.Lock()
+		defer service.pendingMu.Unlock()
+		return service.pendingStarts[testForward.ID]
+	})
 
-	// Verify: pendingStarts should have exactly 1 entry (the forward being started)
 	service.pendingMu.Lock()
 	pendingCount := len(service.pendingStarts)
-	_, exists := service.pendingStarts[testForward.ID]
 	service.pendingMu.Unlock()
-
-	// Signal all goroutines to complete
-	close(syncInitiated)
-	wg.Wait()
-
-	// The key test: pendingStarts should have the forward ID, proving
-	// that only ONE start attempt was made (not 5 concurrent starts)
-	if !exists {
-		t.Errorf("Expected forward ID %s to be in pendingStarts", testForward.ID)
-	}
-
 	if pendingCount != 1 {
 		t.Errorf("Expected 1 entry in pendingStarts (only one start attempt), got %d", pendingCount)
 	}
 
-	// The logs will show "Forward already starting, skipping" for the other 4 calls,
-	// proving the mechanism works correctly
+	// Unblock the start attempt; every sync call must complete without deadlock
+	close(release)
+	wg.Wait()
+
+	// The pending lock must be released after the start attempt completes.
+	// The release runs in the spawned start goroutine, so poll for it.
+	waitFor(t, 2*time.Second, func() bool {
+		service.pendingMu.Lock()
+		defer service.pendingMu.Unlock()
+		return len(service.pendingStarts) == 0
+	})
 }
 
 // TestPendingStartsReleaseOnBackoffSkip verifies that pending lock is released
 // when exponential backoff skips starting a forward
 func TestPendingStartsReleaseOnBackoffSkip(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
@@ -805,10 +783,10 @@ func TestPendingStartsReleaseOnBackoffSkip(t *testing.T) {
 // TestPendingStartsConcurrentDifferentForwards verifies that pendingStarts
 // correctly handles multiple different forwards being started concurrently
 func TestPendingStartsConcurrentDifferentForwards(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 	service, err := New(database)
 	require.NoError(t, err)
+	t.Cleanup(service.cancel)
 
 	// Create 3 different test forwards with unique addresses
 	numForwards := 3
@@ -830,8 +808,7 @@ func TestPendingStartsConcurrentDifferentForwards(t *testing.T) {
 	// Call sync() 5 times concurrently
 	// Each sync should see all 3 forwards in database and try to start them
 	var wg sync.WaitGroup
-	numConcurrentCalls := 5
-	for i := 0; i < numConcurrentCalls; i++ {
+	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -840,8 +817,13 @@ func TestPendingStartsConcurrentDifferentForwards(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Wait a bit for all forwards to complete starting (or failing)
-	time.Sleep(100 * time.Millisecond)
+	// Local binds succeed regardless of the (unreachable) service host, but the
+	// start runs through real SSH config parsing - poll instead of fixed sleep.
+	waitFor(t, 5*time.Second, func() bool {
+		service.mu.Lock()
+		defer service.mu.Unlock()
+		return len(service.forwards) == numForwards
+	})
 
 	// Verify: Exactly 3 forwards were created (not 15, which would indicate duplicates)
 	service.mu.Lock()

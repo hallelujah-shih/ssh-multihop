@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"sync"
 	"time"
@@ -49,22 +50,19 @@ type ForwardService struct {
 	pendingStarts map[string]bool // Track forward IDs currently being started
 	pendingMu     sync.Mutex      // Protect pendingStarts map
 
-	// Passphrase socket for SSH key passphrase retrieval
-	passphraseSocket interface{} // *connection.PassphraseSocket
-
 	// SSH config caching to avoid repeated file I/O and parsing
 	sshConfigCache map[string]*config.SSHConfig // configPath -> parsed SSH config
 	cacheMu        sync.RWMutex                 // Protect sshConfigCache
+
+	// hopResolver resolves a hostname to SSH hop chain (injectable for tests)
+	hopResolver func(hostname string) ([]*tunnel.HopConfig, error)
 }
 
-// ForwardWrapper wraps different forward implementations
+// ForwardWrapper wraps a forward implementation with its lifecycle context
 type ForwardWrapper struct {
-	Type                 db.ForwardType
-	LocalListenToRemote  *forwarding.LocalListenToRemote
-	RemoteListenToLocal  *forwarding.RemoteListenToLocal
-	RemoteListenToRemote *forwarding.RemoteListenToRemote
-	ctx                  context.Context
-	cancel               context.CancelFunc
+	Forward forwarding.Forward
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 // New creates a new ForwardService
@@ -87,6 +85,7 @@ func New(database *db.Database) (*ForwardService, error) {
 		maxBackoff:          120 * time.Second, // max backoff 120s
 		pendingStarts:       make(map[string]bool),
 		sshConfigCache:      make(map[string]*config.SSHConfig),
+		hopResolver:         forwarding.BuildHopChainFromSSHConfig,
 	}
 
 	// Create connection manager with hop config provider (closure captures s)
@@ -117,6 +116,7 @@ func NewWithContext(ctx context.Context, database *db.Database) (*ForwardService
 		maxBackoff:          120 * time.Second, // max backoff 120s
 		pendingStarts:       make(map[string]bool),
 		sshConfigCache:      make(map[string]*config.SSHConfig),
+		hopResolver:         forwarding.BuildHopChainFromSSHConfig,
 	}
 
 	// Create connection manager with hop config provider (closure captures s)
@@ -498,8 +498,7 @@ func (s *ForwardService) CreateForward(fwd *db.Forward) error {
 
 	// Validate
 	if fwd.Type == db.RemoteListenToRemote && fwd.MaxConns != 0 {
-		// InlineForwardOrchestrator doesn't support maxConns
-		return fmt.Errorf("inline forward does not support maxConns parameter")
+		return fmt.Errorf("remote_listen_to_remote does not support maxConns parameter")
 	}
 
 	// Use transaction to create both Forward and Status atomically
@@ -623,21 +622,10 @@ func mergeLiveStatus(status *db.ForwardStatus, w ForwardWrapper) {
 // wrapperStatus returns the in-memory status of a forward wrapper,
 // or StatusStopped if the implementation is missing.
 func wrapperStatus(w ForwardWrapper) forwarding.ForwardStatus {
-	switch w.Type {
-	case db.LocalListenToRemote:
-		if w.LocalListenToRemote != nil {
-			return w.LocalListenToRemote.Status()
-		}
-	case db.RemoteListenToLocal:
-		if w.RemoteListenToLocal != nil {
-			return w.RemoteListenToLocal.Status()
-		}
-	case db.RemoteListenToRemote:
-		if w.RemoteListenToRemote != nil {
-			return w.RemoteListenToRemote.Status()
-		}
+	if w.Forward == nil {
+		return forwarding.StatusStopped
 	}
-	return forwarding.StatusStopped
+	return w.Forward.Status()
 }
 
 // GetPoolStats returns current connection pool statistics
@@ -656,13 +644,6 @@ func (s *ForwardService) GetPoolStats() (map[string]interface{}, error) {
 		"idle_connections":   stats.IdleConnections,
 		"closed_connections": stats.ClosedConnections,
 	}, nil
-}
-
-// SetPassphraseSocket sets the passphrase socket for retrieving SSH key passphrases
-func (s *ForwardService) SetPassphraseSocket(ps interface{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.passphraseSocket = ps
 }
 
 // startForward starts a single forward
@@ -705,71 +686,49 @@ func (s *ForwardService) startForward(fwd *db.Forward) error {
 	bindAddr := fmt.Sprintf("%s:%d", listenIP, listenPort)
 
 	var wrapper ForwardWrapper
-	var forwardImpl forwarding.Forward
 
 	switch fwd.Type {
 	case db.LocalListenToRemote:
 		// For SSH -L forwarding, use the full service address from database
-		localFwd := forwarding.NewLocalListenToRemote(
-			bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
-			fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
-			fwd.ID,
-			s.db,
-			s.pool, // Connection pool for SSH connection reuse
-			serviceHops,
-		)
-		// Set passphrase socket if available
-		if s.passphraseSocket != nil {
-			localFwd.SetPassphraseSocket(s.passphraseSocket)
-		}
-		forwardImpl = localFwd
 		wrapper = ForwardWrapper{
-			Type:                db.LocalListenToRemote,
-			LocalListenToRemote: localFwd,
+			Forward: forwarding.NewLocalListenToRemote(
+				bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
+				fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
+				fwd.ID,
+				s.db,
+				s.pool, // Connection pool for SSH connection reuse
+				serviceHops,
+			),
 		}
 
 	case db.RemoteListenToLocal:
-		remoteFwd := forwarding.NewRemoteListenToLocal(
-			bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
-			fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
-			fwd.ID,
-			s.db,
-			s.pool, // Connection pool for SSH connection reuse
-			listenHops,
-		)
-		// Set passphrase socket if available
-		if s.passphraseSocket != nil {
-			remoteFwd.SetPassphraseSocket(s.passphraseSocket)
-		}
-		forwardImpl = remoteFwd
 		wrapper = ForwardWrapper{
-			Type:                db.RemoteListenToLocal,
-			RemoteListenToLocal: remoteFwd,
+			Forward: forwarding.NewRemoteListenToLocal(
+				bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
+				fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
+				fwd.ID,
+				s.db,
+				s.pool, // Connection pool for SSH connection reuse
+				listenHops,
+			),
 		}
 
 	case db.RemoteListenToRemote:
-		relayFwd := forwarding.NewRemoteListenToRemote(
-			fwd.ListenAddr, // Full listen address (e.g., "127.0.0.1:11434")
-			fwd.ListenHost, // SSH hostname (e.g., "vmr.u24")
-			listenPort,     // Port number
-			listenHops,
-			fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:11434")
-			fwd.ServiceHost, // SSH hostname (e.g., "dc4")
-			servicePort,     // Port number
-			serviceHops,
-			fwd.ID,
-			s.db,
-			s.pool, // Connection pool for SSH connection reuse
-			fwd.MaxConns,
-		)
-		// Set passphrase socket if available
-		if s.passphraseSocket != nil {
-			relayFwd.SetPassphraseSocket(s.passphraseSocket)
-		}
-		forwardImpl = relayFwd
 		wrapper = ForwardWrapper{
-			Type:                 db.RemoteListenToRemote,
-			RemoteListenToRemote: relayFwd,
+			Forward: forwarding.NewRemoteListenToRemote(
+				fwd.ListenAddr, // Full listen address (e.g., "127.0.0.1:11434")
+				fwd.ListenHost, // SSH hostname (e.g., "vmr.u24")
+				listenPort,     // Port number
+				listenHops,
+				fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:11434")
+				fwd.ServiceHost, // SSH hostname (e.g., "dc4")
+				servicePort,     // Port number
+				serviceHops,
+				fwd.ID,
+				s.db,
+				s.pool, // Connection pool for SSH connection reuse
+				fwd.MaxConns,
+			),
 		}
 
 	default:
@@ -782,7 +741,7 @@ func (s *ForwardService) startForward(fwd *db.Forward) error {
 	wrapper.cancel = cancel
 
 	// Start forward
-	if err := forwardImpl.Start(ctx); err != nil {
+	if err := wrapper.Forward.Start(ctx); err != nil {
 		zap.L().Error("Failed to start forward, cleaning up resources",
 			zap.String("id", fwd.ID),
 			zap.String("type", string(fwd.Type)),
@@ -794,7 +753,7 @@ func (s *ForwardService) startForward(fwd *db.Forward) error {
 		// 1. Cancel context to trigger cleanup
 		// 2. Wait for all goroutines (acceptLoop, healthCheck, cleanupMonitor) to exit
 		// 3. Ensure all resources are released
-		if stopErr := forwardImpl.Stop(); stopErr != nil {
+		if stopErr := wrapper.Forward.Stop(); stopErr != nil {
 			zap.L().Error("Error cleaning up failed forward",
 				zap.String("id", fwd.ID),
 				zap.Error(stopErr))
@@ -825,24 +784,10 @@ func (s *ForwardService) stopWrapper(wrapper ForwardWrapper) {
 		wrapper.cancel()
 	}
 
-	// Stop forward
-	var err error
-	switch wrapper.Type {
-	case db.RemoteListenToRemote:
-		if wrapper.RemoteListenToRemote != nil {
-			err = wrapper.RemoteListenToRemote.Stop()
-		}
-	case db.LocalListenToRemote:
-		if wrapper.LocalListenToRemote != nil {
-			err = wrapper.LocalListenToRemote.Stop()
-		}
-	case db.RemoteListenToLocal:
-		if wrapper.RemoteListenToLocal != nil {
-			err = wrapper.RemoteListenToLocal.Stop()
-		}
+	if wrapper.Forward == nil {
+		return
 	}
-
-	if err != nil {
+	if err := wrapper.Forward.Stop(); err != nil {
 		zap.L().Warn("Error stopping forward", zap.Error(err))
 	}
 }
@@ -858,19 +803,8 @@ func (s *ForwardService) stopWrapperWithContext(wrapper ForwardWrapper, ctx cont
 	done := make(chan error, 1)
 	go func() {
 		var err error
-		switch wrapper.Type {
-		case db.RemoteListenToRemote:
-			if wrapper.RemoteListenToRemote != nil {
-				err = wrapper.RemoteListenToRemote.Stop()
-			}
-		case db.LocalListenToRemote:
-			if wrapper.LocalListenToRemote != nil {
-				err = wrapper.LocalListenToRemote.Stop()
-			}
-		case db.RemoteListenToLocal:
-			if wrapper.RemoteListenToLocal != nil {
-				err = wrapper.RemoteListenToLocal.Stop()
-			}
+		if wrapper.Forward != nil {
+			err = wrapper.Forward.Stop()
 		}
 		done <- err
 	}()
@@ -1061,7 +995,7 @@ func (s *ForwardService) getHopsForHost(hostname string) ([]*tunnel.HopConfig, e
 		return []*tunnel.HopConfig{}, nil
 	}
 
-	hops, err := forwarding.BuildHopChainFromSSHConfig(hostname)
+	hops, err := s.hopResolver(hostname)
 	if err != nil {
 		return nil, err
 	}
@@ -1119,16 +1053,25 @@ func (s *ForwardService) buildHopsFromSignature(sig connection.ConnectionSignatu
 		// Cache miss - parse SSH config file
 		parser := config.NewParser()
 		parsedConfig, err := parser.ParseConfig(configPath)
-		if err != nil {
-			// If SSH config doesn't exist, continue with minimal config
+		switch {
+		case err == nil:
+			s.cacheMu.Lock()
+			s.sshConfigCache[configPath] = parsedConfig
+			s.cacheMu.Unlock()
+		case errors.Is(err, fs.ErrNotExist):
+			// No SSH config: continue with minimal config, cache the miss
 			// This allows the system to work without ~/.ssh/config
+			s.cacheMu.Lock()
+			s.sshConfigCache[configPath] = nil
+			s.cacheMu.Unlock()
+			parsedConfig = nil
+		default:
+			// Parse failure: don't cache so the next call retries
+			zap.L().Warn("Failed to parse SSH config, will retry on next access",
+				zap.String("config_path", configPath),
+				zap.Error(err))
 			parsedConfig = nil
 		}
-
-		// Cache the parsed config (even nil is cached to avoid repeated failed parses)
-		s.cacheMu.Lock()
-		s.sshConfigCache[configPath] = parsedConfig
-		s.cacheMu.Unlock()
 
 		sshConfig = parsedConfig
 	}

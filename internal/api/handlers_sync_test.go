@@ -18,15 +18,7 @@ import (
 // TestCreateForwardAsync tests sync=false (default behavior)
 func TestCreateForwardAsync(t *testing.T) {
 	// Setup
-	database, err := db.New(db.Config{Path: ":memory:"})
-	if err != nil {
-		t.Fatalf("Failed to create database: %v", err)
-	}
-	defer func() {
-		if err := database.Close(); err != nil {
-			t.Logf("Failed to close database: %v", err)
-		}
-	}()
+	database := db.NewTestDB(t)
 
 	svc, err := service.NewWithContext(context.Background(), database)
 	require.NoError(t, err)
@@ -77,15 +69,7 @@ func TestCreateForwardAsync(t *testing.T) {
 // TestCreateForwardSyncTimeout tests sync=true with timeout scenario
 func TestCreateForwardSyncTimeout(t *testing.T) {
 	// Setup
-	database, err := db.New(db.Config{Path: ":memory:"})
-	if err != nil {
-		t.Fatalf("Failed to create database: %v", err)
-	}
-	defer func() {
-		if err := database.Close(); err != nil {
-			t.Logf("Failed to close database: %v", err)
-		}
-	}()
+	database := db.NewTestDB(t)
 
 	svc, err := service.NewWithContext(context.Background(), database)
 	require.NoError(t, err)
@@ -152,15 +136,7 @@ func TestCreateForwardSyncTimeout(t *testing.T) {
 // TestCreateForwardSyncImmediateError tests sync=true with immediate error
 func TestCreateForwardSyncImmediateError(t *testing.T) {
 	// Setup
-	database, err := db.New(db.Config{Path: ":memory:"})
-	if err != nil {
-		t.Fatalf("Failed to create database: %v", err)
-	}
-	defer func() {
-		if err := database.Close(); err != nil {
-			t.Logf("Failed to close database: %v", err)
-		}
-	}()
+	database := db.NewTestDB(t)
 
 	svc, err := service.NewWithContext(context.Background(), database)
 	require.NoError(t, err)

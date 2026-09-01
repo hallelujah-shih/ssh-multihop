@@ -56,7 +56,4 @@ type Forward interface {
 
 	// String returns a string representation (for debugging)
 	String() string
-
-	// SetPassphraseSocket sets the passphrase socket for retrieving SSH key passphrases
-	SetPassphraseSocket(ps interface{})
 }

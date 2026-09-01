@@ -120,11 +120,10 @@ func Example() {
 ```go
 // Package forwarding provides port forwarding implementations.
 //
-// The package supports four forward types:
+// The package supports three forward types:
 //   - LocalListenToRemote: SSH -L (local listen to remote service)
 //   - RemoteListenToLocal: SSH -R (remote listen to local service)
 //   - RemoteListenToRemote: Remote-to-remote bridging
-//   - InlineForwardOrchestrator: Composed forwarding using UDS bridge
 //
 // Architecture:
 // All forwards follow the simplified architecture:
@@ -152,7 +151,8 @@ package forwarding
 ```go
 // Start begins the port forwarding.
 //
-// This method blocks until the forward is stopped or an error occurs.
+// This method spawns the accept, health monitoring, and cleanup goroutines
+// and returns immediately; stopping is driven by context cancellation.
 // On error, the database status is set to "error" and resources are cleaned up.
 //
 // Parameters:
@@ -164,7 +164,7 @@ package forwarding
 // Side effects:
 //   - Opens SSH connections to target hosts
 //   - Creates listener (local or remote depending on type)
-//   - Launches health monitoring goroutine (15s interval)
+//   - Launches health monitoring goroutine (random 15-30s interval)
 //   - Updates database status on errors
 //
 // The forward runs independently until stopped or error occurs.
@@ -185,7 +185,7 @@ func (f *Forward) Start(ctx context.Context) error {
 ```go
 // ForwardService manages the lifecycle of all port forwards.
 //
-// The service runs a sync loop every 5 seconds to:
+// The service runs a sync loop every 10 seconds to:
 //   - Start new forwards from database
 //   - Stop deleted forwards
 //   - Rebuild forwards in error state

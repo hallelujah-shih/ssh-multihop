@@ -35,10 +35,6 @@ type HealthChecker struct {
 	// monitoredConnections holds connections being monitored, keyed by signature hash.
 	monitoredConnections map[string]*PooledConnection
 
-	// affectedForwards maps connection signatures to lists of forward IDs.
-	// When a connection fails, all these forwards need to be notified.
-	affectedForwards map[string][]string
-
 	// mu protects concurrent access to the maps.
 	mu sync.RWMutex
 
@@ -57,7 +53,6 @@ type HealthChecker struct {
 func NewHealthChecker(config HealthCheckConfig) *HealthChecker {
 	hc := &HealthChecker{
 		monitoredConnections: make(map[string]*PooledConnection),
-		affectedForwards:     make(map[string][]string),
 		config:               config,
 		done:                 make(chan struct{}),
 	}
@@ -86,38 +81,6 @@ func (hc *HealthChecker) Unregister(conn *PooledConnection) {
 
 	hash := conn.Signature.Hash()
 	delete(hc.monitoredConnections, hash)
-
-	// Also clean up affected forwards
-	delete(hc.affectedForwards, hash)
-}
-
-// RegisterForward registers a forward ID as using the given connection.
-// When the connection fails, this forward will be notified via context cancellation.
-func (hc *HealthChecker) RegisterForward(conn *PooledConnection, forwardID string) {
-	hc.mu.Lock()
-	defer hc.mu.Unlock()
-
-	hash := conn.Signature.Hash()
-	hc.affectedForwards[hash] = append(hc.affectedForwards[hash], forwardID)
-}
-
-// UnregisterForward removes a forward ID from the connection's list.
-func (hc *HealthChecker) UnregisterForward(conn *PooledConnection, forwardID string) {
-	hc.mu.Lock()
-	defer hc.mu.Unlock()
-
-	hash := conn.Signature.Hash()
-	forwards := hc.affectedForwards[hash]
-
-	// Filter out the forward ID
-	newForwards := make([]string, 0, len(forwards))
-	for _, id := range forwards {
-		if id != forwardID {
-			newForwards = append(newForwards, id)
-		}
-	}
-
-	hc.affectedForwards[hash] = newForwards
 }
 
 // checkLoop runs in the background, performing periodic health checks.
@@ -197,30 +160,16 @@ func (hc *HealthChecker) checkConnection(conn *PooledConnection) error {
 	}
 }
 
-// handleFailure handles a connection failure by cancelling the context
-// and notifying all affected forwards.
+// handleFailure handles a connection failure by cancelling the connection's
+// context, which cascades to all forwards using it.
 //
 // Note: This does NOT remove the connection from the pool.
 // The connection will be removed lazily when ConnectionManager.Acquire()
 // validates the connection and finds it dead.
-func (hc *HealthChecker) handleFailure(conn *PooledConnection, err error) {
-	hash := conn.Signature.Hash()
-
-	hc.mu.RLock()
-	forwardIDs := hc.affectedForwards[hash]
-	hc.mu.RUnlock()
-
-	// Cancel the connection's context, which cascades to all forwards
+func (hc *HealthChecker) handleFailure(conn *PooledConnection, _ error) {
+	// Cancel the connection's context; forwards detect the cancellation
+	// and mark themselves failed. ForwardService handles rebuilding.
 	conn.CancelFunc()
-
-	// Log the failure (in production, this would go to a proper logger)
-	// For now, we just mark the connection as failed
-	// The forwards will detect the context cancellation and handle it
-
-	// Notify affected forwards
-	// In the full implementation, this would update the database status
-	// For now, the context cancellation is sufficient for forwards to detect failure
-	_ = forwardIDs // Will be used in Task 2.5 for database updates
 }
 
 // Close stops the health checker.
