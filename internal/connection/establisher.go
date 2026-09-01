@@ -54,7 +54,7 @@ func Establish(hops []*tunnel.HopConfig, builder *SSHClientConfigBuilder) (final
 		} else {
 			// Subsequent hops: dial through previous hop
 			prevClient := allClients[i-1]
-			conn, err = prevClient.Dial("tcp", addr)
+			conn, err = dialThroughWithTimeout(prevClient, addr)
 		}
 
 		if err != nil {
@@ -74,7 +74,7 @@ func Establish(hops []*tunnel.HopConfig, builder *SSHClientConfigBuilder) (final
 		}
 
 		// Create SSH client connection
-		sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, sshConfig)
+		sshConn, chans, reqs, err := newClientConnWithDeadline(conn, addr, sshConfig)
 		if err != nil {
 			_ = conn.Close()
 			closeAllClients(allClients)
@@ -101,8 +101,60 @@ func closeAllClients(clients []*ssh.Client) {
 	}
 }
 
-// defaultTimeout is the default timeout for establishing TCP connections
-const defaultTimeout = 30 * time.Second
+// defaultTimeout bounds TCP dial, tunneled channel-open, and the SSH handshake.
+// Without it a stalled peer wedges the service sync loop (pendingStarts never cleared).
+var defaultTimeout = 30 * time.Second
+
+// newClientConnWithDeadline bounds the SSH handshake to defaultTimeout.
+// x/crypto's ClientConfig.Timeout only applies to ssh.Dial, and SetDeadline
+// is unsupported on tunneled channel conns (tcpChan), so the handshake runs
+// in a goroutine and the conn is closed on timeout to unblock it.
+func newClientConnWithDeadline(conn net.Conn, addr string, config *ssh.ClientConfig) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+	type result struct {
+		conn  ssh.Conn
+		chans <-chan ssh.NewChannel
+		reqs  <-chan *ssh.Request
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		c, chs, rq, err := ssh.NewClientConn(conn, addr, config)
+		ch <- result{c, chs, rq, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.conn, r.chans, r.reqs, r.err
+	case <-time.After(defaultTimeout):
+		_ = conn.Close()
+		return nil, nil, nil, fmt.Errorf("SSH handshake with %s timed out after %s", addr, defaultTimeout)
+	}
+}
+
+// dialThroughWithTimeout bounds client.Dial; SSH channel-open has no deadline
+// support, so a stalled channel open would otherwise block forever. Late
+// arrivals after timeout are closed by a drainer goroutine.
+func dialThroughWithTimeout(client *ssh.Client, addr string) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		c, err := client.Dial("tcp", addr)
+		ch <- result{c, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.conn, r.err
+	case <-time.After(defaultTimeout):
+		go func() {
+			if r := <-ch; r.conn != nil {
+				_ = r.conn.Close()
+			}
+		}()
+		return nil, fmt.Errorf("dial %s through previous hop timed out after %s", addr, defaultTimeout)
+	}
+}
 
 // HopSource indicates how a hop connection was obtained
 type HopSource int
@@ -200,7 +252,7 @@ func EstablishWithReuse(
 			if i == 0 {
 				conn, err = net.DialTimeout("tcp", addr, defaultTimeout)
 			} else {
-				conn, err = prevClient.Dial("tcp", addr)
+				conn, err = dialThroughWithTimeout(prevClient, addr)
 			}
 
 			if err != nil {
@@ -216,7 +268,7 @@ func EstablishWithReuse(
 				}
 			}
 
-			sshConn, chans, reqs, handshakeErr := ssh.NewClientConn(conn, addr, sshConfig)
+			sshConn, chans, reqs, handshakeErr := newClientConnWithDeadline(conn, addr, sshConfig)
 			if handshakeErr != nil {
 				_ = conn.Close()
 				cleanupCreatedHops(hopInfos)
