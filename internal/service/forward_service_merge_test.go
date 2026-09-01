@@ -16,12 +16,11 @@ func injectStoppedForward(t *testing.T, svc *ForwardService, id string) {
 	t.Helper()
 	lf := forwarding.NewLocalListenToRemote("127.0.0.1:19999", "127.0.0.1:19998", id, nil, nil, nil)
 	svc.mu.Lock()
-	svc.forwards[id] = ForwardWrapper{Type: db.LocalListenToRemote, LocalListenToRemote: lf}
+	svc.forwards[id] = ForwardWrapper{Forward: lf}
 	svc.mu.Unlock()
 }
 
 func TestGetStatus_MergesInMemoryState(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 
 	svc, err := New(database)
@@ -43,7 +42,6 @@ func TestGetStatus_MergesInMemoryState(t *testing.T) {
 }
 
 func TestGetStatus_PassesThroughWhenNotLoaded(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 
 	svc, err := New(database)
@@ -64,7 +62,6 @@ func TestGetStatus_PassesThroughWhenNotLoaded(t *testing.T) {
 }
 
 func TestListStatuses_MergesInMemoryState(t *testing.T) {
-	setupTestLogger()
 	database := setupTestDB(t)
 
 	svc, err := New(database)
