@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hallelujah-shih/ssh-multihop/internal/tunnel"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/singleflight"
 )
@@ -83,6 +84,11 @@ type ConnectionManager struct {
 	// healthChecker performs health checks on all active connections.
 	healthChecker *HealthChecker
 
+	// keepalive knobs: probe interval and per-probe reply budget.
+	// ponytail: fixed values, promote to flags if tuning ever matters.
+	keepaliveInterval time.Duration
+	keepaliveTimeout  time.Duration
+
 	// closeOnce ensures Close() is idempotent.
 	closeOnce sync.Once
 }
@@ -105,6 +111,8 @@ func NewConnectionManager(config PoolConfig, hopConfigProvider HopConfigProvider
 		config:            config,
 		hopConfigProvider: hopConfigProvider,
 		healthChecker:     healthChecker,
+		keepaliveInterval: 30 * time.Second,
+		keepaliveTimeout:  10 * time.Second,
 	}
 
 	return cm
@@ -223,6 +231,7 @@ func (cm *ConnectionManager) Acquire(ctx context.Context, sig ConnectionSignatur
 
 		// Start health checking
 		cm.healthChecker.Monitor(pooledConn)
+		cm.startKeepalive(pooledConn)
 
 		return pooledConn, nil
 	})
@@ -305,6 +314,7 @@ func (cm *ConnectionManager) addPartial(sig ConnectionSignature, client *ssh.Cli
 	cm.mu.Unlock()
 
 	cm.healthChecker.Monitor(pooledConn)
+	cm.startKeepalive(pooledConn)
 }
 
 // dialSSH establishes a new SSH connection for the given signature.
@@ -455,6 +465,77 @@ func (cm *ConnectionManager) isConnectionAlive(conn *PooledConnection) bool {
 	case <-ctx.Done():
 		// Timeout means connection is not responding
 		return false
+	}
+}
+
+// startKeepalive probes the connection periodically so a half-dead connection
+// (NAT dropped state, no FIN/RST delivered) is evicted quickly instead of
+// leaving the remote sshd holding zombie listeners for hours.
+func (cm *ConnectionManager) startKeepalive(conn *PooledConnection) {
+	go func() {
+		ticker := time.NewTicker(cm.keepaliveInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if conn.GetStatus() == StatusClosed {
+				return
+			}
+			if !cm.probeConnection(conn) {
+				zap.L().Warn("Keepalive probe failed, evicting dead connection",
+					zap.String("signature_hash", conn.Signature.Hash()))
+				cm.evictConnection(conn)
+				return
+			}
+		}
+	}()
+}
+
+// probeConnection sends one keepalive request and reports whether the peer
+// answered within the timeout. The reply (even a request-failure) proves
+// liveness; silence means the path is dead.
+func (cm *ConnectionManager) probeConnection(conn *PooledConnection) bool {
+	if conn.Client == nil {
+		return true
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := conn.Client.SendRequest("keepalive@openssh.com", true, nil)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		return err == nil
+	case <-time.After(cm.keepaliveTimeout):
+		return false
+	}
+}
+
+// evictConnection unconditionally removes a connection from the pool and
+// closes its SSH clients, even if ref count > 0. Forwards holding the evicted
+// connection fail fast on their next operation and get rebuilt by the service
+// layer. The guard against map replacement prevents evicting a newer
+// connection created for the same signature.
+func (cm *ConnectionManager) evictConnection(conn *PooledConnection) {
+	hash := conn.Signature.Hash()
+
+	cm.mu.Lock()
+	if current, exists := cm.pools[hash]; exists && current == conn {
+		delete(cm.pools, hash)
+	}
+	cm.mu.Unlock()
+
+	cm.healthChecker.Unregister(conn)
+	conn.Close()
+
+	if len(conn.AllClients) > 0 {
+		for i := len(conn.AllClients) - 1; i >= 0; i-- {
+			if conn.AllClients[i] != nil {
+				_ = conn.AllClients[i].Close()
+			}
+		}
+	} else if conn.Client != nil {
+		_ = conn.Client.Close()
 	}
 }
 
