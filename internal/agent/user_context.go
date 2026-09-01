@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"syscall"
 
 	"github.com/hallelujah-shih/ssh-multihop/internal/util"
 	"go.uber.org/zap"
@@ -77,23 +76,6 @@ func (uc *UserContext) GetSSHDir() string {
 	return filepath.Join(uc.HomeDir, ".ssh")
 }
 
-// GetAgentSocketPath returns the path to the agent socket file.
-// The socket is placed in a temporary directory for better portability.
-// Priority: XDG_RUNTIME_DIR (if set) > /tmp > $HOME/.ssh-multihop/agent
-func (uc *UserContext) GetAgentSocketPath() string {
-	// Try XDG_RUNTIME_DIR first (systemd sets this, guarantees per-user isolation)
-	if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
-		agentDir := filepath.Join(runtimeDir, "ssh-multihop")
-		pid := os.Getpid()
-		return filepath.Join(agentDir, fmt.Sprintf("agent.%d.sock", pid))
-	}
-
-	// Fallback to system temp directory
-	agentDir := filepath.Join(os.TempDir(), fmt.Sprintf("ssh-multihop-%d", uc.UID))
-	pid := os.Getpid()
-	return filepath.Join(agentDir, fmt.Sprintf("agent.%d.sock", pid))
-}
-
 // GetAgentDir returns the directory where agent sockets are stored.
 func (uc *UserContext) GetAgentDir() string {
 	// Try XDG_RUNTIME_DIR first (systemd sets this, guarantees per-user isolation)
@@ -127,44 +109,4 @@ func (uc *UserContext) IsSetUID() bool {
 	euid := os.Geteuid()
 	egid := os.Getegid()
 	return uc.UID != euid || uc.GID != egid
-}
-
-// GetEffectiveUser returns the effective user (owner of the binary).
-func (uc *UserContext) GetEffectiveUser() string {
-	euid := os.Geteuid()
-	if u, err := user.LookupId(fmt.Sprintf("%d", euid)); err == nil {
-		return u.Username
-	}
-	return fmt.Sprintf("euid_%d", euid)
-}
-
-// DropPrivileges temporarily drops privileges to the real user.
-// This is useful for operations that need to run as the real user.
-// Returns a function to restore privileges.
-func (uc *UserContext) DropPrivileges() (restore func(), err error) {
-	if !uc.IsSetUID() {
-		// Not running in setuid mode, no need to drop
-		return func() {}, nil
-	}
-
-	euid := os.Geteuid()
-	egid := os.Getegid()
-
-	// Drop to real user
-	if err := syscall.Setegid(uc.GID); err != nil {
-		return nil, fmt.Errorf("failed to drop group privileges: %w", err)
-	}
-	if err := syscall.Seteuid(uc.UID); err != nil {
-		// Restore group before returning
-		_ = syscall.Setegid(egid)
-		return nil, fmt.Errorf("failed to drop user privileges: %w", err)
-	}
-
-	// Return restore function
-	restore = func() {
-		_ = syscall.Seteuid(euid)
-		_ = syscall.Setegid(egid)
-	}
-
-	return restore, nil
 }

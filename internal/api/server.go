@@ -17,8 +17,6 @@ import (
 // Server represents the HTTP API server
 type Server struct {
 	httpServer *http.Server
-	service    *service.ForwardService
-	db         *db.Database
 }
 
 // Config holds server configuration
@@ -66,8 +64,6 @@ func NewServer(cfg Config, svc *service.ForwardService, database *db.Database) *
 
 	return &Server{
 		httpServer: httpServer,
-		service:    svc,
-		db:         database,
 	}
 }
 

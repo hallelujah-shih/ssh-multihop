@@ -232,11 +232,6 @@ func runDaemon(c *cli.Context) error {
 		return fmt.Errorf("failed to create service: %w", err)
 	}
 
-	// Set passphrase socket if available
-	if passphraseSocket != nil {
-		svc.SetPassphraseSocket(passphraseSocket)
-	}
-
 	// Start service (load and start all forwards)
 	if err := svc.Start(); err != nil {
 		// Cleanup service if start fails
@@ -320,7 +315,9 @@ func runDaemon(c *cli.Context) error {
 
 			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer stopCancel()
-			_ = svc.StopWithContext(stopCtx)
+			if err := svc.StopWithContext(stopCtx); err != nil {
+				zap.L().Warn("Service stop completed with errors", zap.Error(err))
+			}
 
 			if agent, agentErr := agent.GetBuiltInAgent(); agentErr == nil {
 				_ = agent.Stop()

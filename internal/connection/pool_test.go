@@ -17,7 +17,6 @@ func TestConnectionManager_New(t *testing.T) {
 
 	require.NotNil(t, cm)
 	assert.NotNil(t, cm.pools)
-	assert.NotNil(t, cm.done)
 
 	// Cleanup
 	_ = cm.Close()

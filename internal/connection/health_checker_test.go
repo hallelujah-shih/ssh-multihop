@@ -1,6 +1,7 @@
 package connection
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -15,7 +16,6 @@ func TestHealthChecker_New(t *testing.T) {
 
 	require.NotNil(t, hc)
 	assert.NotNil(t, hc.monitoredConnections)
-	assert.NotNil(t, hc.affectedForwards)
 
 	// Cleanup
 	_ = hc.Close()
@@ -63,56 +63,6 @@ func TestHealthChecker_Unregister(t *testing.T) {
 	hc.mu.RUnlock()
 
 	assert.False(t, exists, "Connection should not be monitored after unregister")
-}
-
-// TestHealthChecker_RegisterForward verifies forward registration.
-func TestHealthChecker_RegisterForward(t *testing.T) {
-	config := DefaultHealthCheckConfig()
-	hc := NewHealthChecker(config)
-
-	sig := ConnectionSignature{Username: "user", Hostname: "host", Port: 22}
-	conn := NewPooledConnection(nil, sig)
-
-	// Register multiple forwards
-	hc.RegisterForward(conn, "forward-1")
-	hc.RegisterForward(conn, "forward-2")
-	hc.RegisterForward(conn, "forward-3")
-
-	// Verify forwards are registered
-	hc.mu.RLock()
-	forwards := hc.affectedForwards[sig.Hash()]
-	hc.mu.RUnlock()
-
-	assert.Len(t, forwards, 3, "Should have 3 registered forwards")
-	assert.Contains(t, forwards, "forward-1")
-	assert.Contains(t, forwards, "forward-2")
-	assert.Contains(t, forwards, "forward-3")
-}
-
-// TestHealthChecker_UnregisterForward verifies forward unregistration.
-func TestHealthChecker_UnregisterForward(t *testing.T) {
-	config := DefaultHealthCheckConfig()
-	hc := NewHealthChecker(config)
-
-	sig := ConnectionSignature{Username: "user", Hostname: "host", Port: 22}
-	conn := NewPooledConnection(nil, sig)
-
-	// Register then unregister forwards
-	hc.RegisterForward(conn, "forward-1")
-	hc.RegisterForward(conn, "forward-2")
-	hc.RegisterForward(conn, "forward-3")
-
-	hc.UnregisterForward(conn, "forward-2")
-
-	// Verify forward-2 is removed
-	hc.mu.RLock()
-	forwards := hc.affectedForwards[sig.Hash()]
-	hc.mu.RUnlock()
-
-	assert.Len(t, forwards, 2, "Should have 2 registered forwards after unregister")
-	assert.NotContains(t, forwards, "forward-2")
-	assert.Contains(t, forwards, "forward-1")
-	assert.Contains(t, forwards, "forward-3")
 }
 
 // TestHealthChecker_CheckLoop verifies that the check loop runs and monitors connections.
@@ -193,4 +143,45 @@ func TestHealthCheckConfig_DefaultConfig(t *testing.T) {
 
 	assert.Equal(t, 15*time.Second, config.Interval)
 	assert.Equal(t, 5*time.Second, config.Timeout)
+}
+
+// TestHealthChecker_HandleFailure_CancelsConnectionContext verifies that a failed
+// health check cancels the connection's context, so forwards on a dead SSH
+// connection see cancellation and ForwardService can rebuild them.
+func TestHealthChecker_HandleFailure_CancelsConnectionContext(t *testing.T) {
+	hc := NewHealthChecker(DefaultHealthCheckConfig())
+	defer func() { _ = hc.Close() }()
+
+	sig := ConnectionSignature{Username: "user", Hostname: "host", Port: 22}
+	conn := NewPooledConnection(nil, sig)
+
+	hc.handleFailure(conn, errors.New("keepalive timeout"))
+
+	select {
+	case <-conn.Context.Done():
+	case <-time.After(time.Second):
+		t.Fatal("connection context was not cancelled after handleFailure")
+	}
+}
+
+// TestHealthChecker_HandleFailure_RepeatedDoesNotPanic verifies that repeated
+// failures on the same connection are safe: context cancellation is idempotent,
+// so a flapping connection must not panic the health check loop.
+func TestHealthChecker_HandleFailure_RepeatedDoesNotPanic(t *testing.T) {
+	hc := NewHealthChecker(DefaultHealthCheckConfig())
+	defer func() { _ = hc.Close() }()
+
+	sig := ConnectionSignature{Username: "user", Hostname: "host", Port: 22}
+	conn := NewPooledConnection(nil, sig)
+
+	assert.NotPanics(t, func() {
+		hc.handleFailure(conn, errors.New("first failure"))
+		hc.handleFailure(conn, errors.New("second failure"))
+	})
+
+	select {
+	case <-conn.Context.Done():
+	default:
+		t.Fatal("connection context should be cancelled")
+	}
 }

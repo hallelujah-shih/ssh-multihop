@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 // MultiplexedForward represents a forward that uses connection pooling.
@@ -118,7 +120,11 @@ func (mf *MultiplexedForward) NewChannel(target string) (net.Conn, error) {
 	sshConn, err := conn.Client.Dial("tcp", target)
 	if err != nil {
 		// Release the connection if channel creation fails
-		_ = mf.pool.Release(conn, mf.forwardID)
+		if relErr := mf.pool.Release(conn, mf.forwardID); relErr != nil {
+			zap.L().Warn("Failed to release connection after channel creation error",
+				zap.String("forward_id", mf.forwardID),
+				zap.Error(relErr))
+		}
 		return nil, fmt.Errorf("failed to create SSH channel: %w", err)
 	}
 

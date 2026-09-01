@@ -2,7 +2,6 @@ package agent
 
 import (
 	"errors"
-	"io"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
@@ -260,17 +259,4 @@ func (m *MemoryAgent) GetKeyCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.keys)
-}
-
-// IsLocked returns whether the agent is locked.
-func (m *MemoryAgent) IsLocked() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.locked
-}
-
-// Serve serves the agent protocol on the given connection.
-// It returns when an I/O error occurs.
-func Serve(ag agent.Agent, c io.ReadWriter) error {
-	return agent.ServeAgent(ag, c)
 }

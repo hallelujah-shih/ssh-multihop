@@ -82,13 +82,3 @@ func (f *Forward) BeforeUpdate(tx *gorm.DB) error {
 func generateForwardID(fwdType ForwardType, listenHost string, listenAddr string, serviceHost string, serviceAddr string) string {
 	return fmt.Sprintf("%s-%s-%s-%s-%s", fwdType, listenHost, listenAddr, serviceHost, serviceAddr)
 }
-
-// IsRunning returns true if the forward is in running state
-func (fs *ForwardStatus) IsRunning() bool {
-	return fs.Status == "running"
-}
-
-// DBNow returns current time for database operations
-func DBNow() time.Time {
-	return time.Now()
-}
