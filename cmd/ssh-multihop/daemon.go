@@ -97,7 +97,7 @@ var daemonCommand = &cli.Command{
 		},
 		&cli.StringFlag{
 			Name:  "passphrase-socket",
-			Usage: "Path to Unix socket for receiving SSH key passphrases (default: /run/user/<uid>/ssh-multihop/passphrase.sock)",
+			Usage: "Path to Unix socket for receiving SSH key passphrases (default: $XDG_RUNTIME_DIR/ssh-multihop/passphrase.sock or /tmp/ssh-multihop-<uid>/passphrase.sock)",
 		},
 	},
 	Action: func(c *cli.Context) error {
@@ -130,9 +130,12 @@ func runDaemon(c *cli.Context) error {
 
 	// Set default passphrase socket path if not specified
 	if passphraseSocketPath == "" {
-		// Use /run/user/<uid>/ssh-multihop/passphrase.sock
 		uid := os.Getuid()
-		passphraseSocketPath = fmt.Sprintf("/run/user/%d/ssh-multihop/passphrase.sock", uid)
+		if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
+			passphraseSocketPath = filepath.Join(runtimeDir, "ssh-multihop", "passphrase.sock")
+		} else {
+			passphraseSocketPath = filepath.Join(os.TempDir(), fmt.Sprintf("ssh-multihop-%d", uid), "passphrase.sock")
+		}
 	}
 
 	// Ensure database directory exists
