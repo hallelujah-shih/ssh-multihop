@@ -32,3 +32,4 @@ vendor/
 
 # Claude Code project files
 .claude/projects/
+.worktrees/
