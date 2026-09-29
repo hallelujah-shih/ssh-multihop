@@ -208,14 +208,14 @@ func (inf *RemoteListenToRemote) Start(ctx context.Context) error {
 	// Listen on sourceAddr (e.g., "127.0.0.1:11434") through SSH connection
 	listener, err := sourcePooledConn.Client.Listen("tcp", inf.sourceAddr)
 	if err != nil {
-		// Release both connections if listener creation fails
+		annotated := annotateListenDenied(sourcePooledConn.Client, inf.sourceAddr, err)
 		_ = inf.pool.Release(sourcePooledConn, inf.forwardID)
 		_ = inf.pool.Release(targetPooledConn, inf.forwardID)
 		zap.L().Error("Failed to listen on source",
 			zap.String("forward", inf.String()),
 			zap.String("source_listen", inf.sourceAddr),
-			zap.Error(err))
-		return fmt.Errorf("failed to create listener: %w", err)
+			zap.Error(annotated))
+		return fmt.Errorf("failed to create listener: %w", annotated)
 	}
 
 	// Success! Store resources and start forward
@@ -266,7 +266,11 @@ func (inf *RemoteListenToRemote) Start(ctx context.Context) error {
 
 				// Close listener object (no-op if SSH already closed it)
 				if inf.listener != nil {
-					_ = inf.listener.Close()
+					if err := inf.listener.Close(); err != nil {
+						zap.L().Warn(cancelUndeliveredWarn,
+							zap.String("forward", inf.String()),
+							zap.Error(err))
+					}
 				}
 
 				zap.L().Info("Partial cleanup complete",
@@ -323,7 +327,10 @@ func (inf *RemoteListenToRemote) cleanupMonitor(ctx context.Context) {
 		// Note: This will be closed again by SSH connection cleanup (safe no-op)
 		if inf.listener != nil {
 			if err := inf.listener.Close(); err != nil {
-				zap.L().Debug("Error closing listener", zap.Error(err))
+				zap.L().Warn(cancelUndeliveredWarn,
+					zap.String("forward", inf.String()),
+					zap.String("source_listen", inf.sourceAddr),
+					zap.Error(err))
 			}
 		}
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hallelujah-shih/ssh-multihop/internal/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -123,4 +124,56 @@ func TestRemoteListenToLocal_StartForwardRejected(t *testing.T) {
 	status, err := testDB.GetStatus(forwardID)
 	require.NoError(t, err)
 	assert.Equal(t, "error", status.Status)
+}
+
+// TestRemoteListenToLocal_DenyDiagnosis: a denied tcpip-forward must surface
+// the probe classification in the Start error, and a successful start must
+// not open any probe session.
+func TestRemoteListenToLocal_DenyDiagnosis(t *testing.T) {
+	server := newTestSSHServer(t)
+	pool, hops := newTestConnectionManager(t, server)
+	server.setRejectForward(true)
+	server.setSessionOutput("OCCUPIED", 0)
+	testDB := db.NewTestDB(t)
+
+	rf := NewRemoteListenToLocal("127.0.0.1:23456", "127.0.0.1:22",
+		"deny-diag-test", testDB, pool, hops)
+	err := rf.Start(context.Background())
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "already in LISTEN state",
+		"denied forward must carry the probe classification")
+	assert.ErrorContains(t, err, "denied by peer")
+	assert.ErrorContains(t, err, "failed to create remote listener",
+		"caller prefix must stay verbatim for log greps")
+
+	// Happy path: no probe session may be opened.
+	server2 := newTestSSHServer(t)
+	pool2, hops2 := newTestConnectionManager(t, server2)
+	rf2 := NewRemoteListenToLocal("127.0.0.1:0", "127.0.0.1:22",
+		"deny-diag-test-2", db.NewTestDB(t), pool2, hops2)
+	require.NoError(t, rf2.Start(context.Background()))
+	defer func() { _ = rf2.Stop() }()
+	assert.Equal(t, 0, server2.sessionOpens(),
+		"successful forward must not run the deny probe")
+}
+
+// TestRemoteListenToRemote_DenyPrefix pins the rlr side: the legacy prefix
+// "failed to create listener" must survive verbatim alongside the
+// classification (R2 N-P2-2 — prefix retention is load-bearing for log
+// greps, so it gets its own assertion instead of relying on symmetry).
+func TestRemoteListenToRemote_DenyPrefix(t *testing.T) {
+	server := newTestSSHServer(t)
+	pool, hops := newTestConnectionManager(t, server)
+	server.setRejectForward(true)
+	server.setSessionOutput("OCCUPIED", 0)
+
+	inf := NewRemoteListenToRemote("127.0.0.1:23457", "testdouble", 23457, hops,
+		"127.0.0.1:9999", "testdouble", 9999, hops,
+		"deny-diag-rlr", db.NewTestDB(t), pool, 0)
+	err := inf.Start(context.Background())
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "failed to create listener",
+		"rlr legacy prefix must stay verbatim")
+	assert.ErrorContains(t, err, "already in LISTEN state")
+	assert.ErrorContains(t, err, "denied by peer")
 }

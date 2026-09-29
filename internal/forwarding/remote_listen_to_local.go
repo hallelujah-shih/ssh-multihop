@@ -177,13 +177,15 @@ func (rf *RemoteListenToLocal) Start(ctx context.Context) error {
 	// This creates a listener on the remote SSH server
 	listener, err := pooledConn.Client.Listen("tcp", rf.remoteBindAddr)
 	if err != nil {
-		// Release connection if listener creation fails
+		// Annotate BEFORE releasing: after Release the pooled connection may be
+		// linger-closed concurrently, which would break the probe's session.
+		annotated := annotateListenDenied(pooledConn.Client, rf.remoteBindAddr, err)
 		_ = rf.pool.Release(pooledConn, rf.forwardID)
 		zap.L().Error("Failed to listen on remote",
 			zap.String("forward", rf.String()),
 			zap.String("remote_bind", rf.remoteBindAddr),
-			zap.Error(err))
-		return fmt.Errorf("failed to create remote listener: %w", err)
+			zap.Error(annotated))
+		return fmt.Errorf("failed to create remote listener: %w", annotated)
 	}
 
 	// Success! Store resources and start forward
@@ -223,7 +225,11 @@ func (rf *RemoteListenToLocal) Start(ctx context.Context) error {
 
 				// Close listener
 				if rf.listener != nil {
-					_ = rf.listener.Close()
+					if err := rf.listener.Close(); err != nil {
+						zap.L().Warn(cancelUndeliveredWarn,
+							zap.String("forward", rf.String()),
+							zap.Error(err))
+					}
 				}
 
 				zap.L().Info("Partial cleanup complete",
@@ -463,7 +469,10 @@ func (rf *RemoteListenToLocal) cleanupMonitor(ctx context.Context) {
 		// Step 2: Close listener FIRST to stop accepting new connections
 		if rf.listener != nil {
 			if err := rf.listener.Close(); err != nil {
-				zap.L().Debug("Error closing listener", zap.Error(err))
+				zap.L().Warn(cancelUndeliveredWarn,
+					zap.String("forward", rf.String()),
+					zap.String("remote_bind", rf.remoteBindAddr),
+					zap.Error(err))
 			}
 		}
 
