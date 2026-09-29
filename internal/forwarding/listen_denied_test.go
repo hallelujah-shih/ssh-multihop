@@ -62,7 +62,7 @@ func TestAnnotateListenDenied_UnknownMarker(t *testing.T) {
 }
 
 func TestAnnotateListenDenied_ProbeError(t *testing.T) {
-	pooled, _ := newProbeClient(t, "", 1) // rc=1 simulates session failure
+	pooled, _ := newProbeClient(t, "", 1) // rc=1: remote command exits non-zero (ExitError path)
 	err := annotateListenDenied(pooled.Client, "127.0.0.1:2222", errDeniedCause)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "could not verify remote port state")

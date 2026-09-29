@@ -35,12 +35,12 @@ const denyProbeCmdTmpl = `p=%d; h=$(printf '%%04X' "$p"); ` +
 const listenDeniedMarker = "denied by peer"
 
 // cancelUndeliveredWarn is logged when listener.Close() fails during cleanup:
-// the cancel-tcpip-forward request likely never reached the remote, so the
-// remote listener may linger (until the remote's TCP keepalive or a gateway
-// cleanup) and same-port forward requests may be denied meanwhile.
-const cancelUndeliveredWarn = "cancel-tcpip-forward may not have been delivered; " +
-	"remote listener may linger until remote TCP keepalive or gateway cleanup — " +
-	"same-port forward requests may be denied meanwhile"
+// delivery of cancel-tcpip-forward could not be confirmed. If the connection
+// is dead the remote sshd reclaims the listener on disconnect; if it is not,
+// the listener may linger and same-port forward requests may be denied until
+// the remote releases it.
+const cancelUndeliveredWarn = "cancel-tcpip-forward delivery not confirmed; " +
+	"same-port forward requests may be denied until the remote releases the listener"
 
 // annotateListenDenied enriches a denied tcpip-forward failure with a
 // best-effort remote port-state probe so the operator can act on the error:
