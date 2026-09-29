@@ -1,6 +1,7 @@
 package forwarding
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/hallelujah-shih/ssh-multihop/internal/connection"
 	"github.com/hallelujah-shih/ssh-multihop/internal/tunnel"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 )
@@ -47,6 +49,11 @@ type testSSHServer struct {
 	mu            sync.Mutex
 	listeners     map[string]net.Listener
 	rejectForward bool
+
+	sessionOutput string
+	sessionRC     int
+	sessionDelay  time.Duration
+	sessionCount  int
 
 	wg sync.WaitGroup
 }
@@ -83,6 +90,24 @@ func (s *testSSHServer) setRejectForward(reject bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rejectForward = reject
+}
+
+func (s *testSSHServer) setSessionOutput(out string, rc int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionOutput, s.sessionRC = out, rc
+}
+
+func (s *testSSHServer) setSessionDelay(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionDelay = d
+}
+
+func (s *testSSHServer) sessionOpens() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sessionCount
 }
 
 func (s *testSSHServer) Close() {
@@ -138,8 +163,49 @@ func (s *testSSHServer) handleConn(conn net.Conn) {
 	defer func() { _ = srvConn.Close() }()
 
 	go s.handleRequests(srvConn, reqs)
-	for range chans {
-		// No channel opens are expected from the client side of an -R forward.
+	for ch := range chans {
+		if ch.ChannelType() == "session" {
+			s.handleSession(ch)
+			continue
+		}
+		// Unknown channel types are rejected, matching real sshd behavior.
+		_ = ch.Reject(ssh.UnknownChannelType, "unexpected client channel")
+	}
+}
+
+func (s *testSSHServer) handleSession(ch ssh.NewChannel) {
+	s.mu.Lock()
+	s.sessionCount++
+	out, rc, delay := s.sessionOutput, s.sessionRC, s.sessionDelay
+	s.mu.Unlock()
+
+	channel, reqs, err := ch.Accept()
+	if err != nil {
+		return
+	}
+	defer func() { _ = channel.Close() }()
+
+	for req := range reqs {
+		if req.Type != "exec" {
+			if req.WantReply {
+				_ = req.Reply(false, nil)
+			}
+			continue
+		}
+		var p struct{ Command string }
+		if err := ssh.Unmarshal(req.Payload, &p); err != nil {
+			_ = req.Reply(false, nil)
+			continue
+		}
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		_ = req.Reply(true, nil)
+		if out != "" {
+			_, _ = channel.Write([]byte(out))
+		}
+		_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(rc)}))
+		return
 	}
 }
 
@@ -302,4 +368,31 @@ func newTestConnectionManager(t *testing.T, server *testSSHServer) (*connection.
 	})
 	t.Cleanup(func() { _ = pool.Close() })
 	return pool, hops
+}
+
+// TestSSHServerSessionExec verifies the session/exec testdouble used by the
+// deny-probe tests: exec returns the configured output and exit code.
+func TestSSHServerSessionExec(t *testing.T) {
+	server := newTestSSHServer(t)
+	pool, hops := newTestConnectionManager(t, server)
+
+	server.setSessionOutput("OCCUPIED", 0)
+
+	sig := connection.ConnectionSignature{
+		Username: hops[0].User,
+		Hostname: hops[0].HostName,
+		Port:     hops[0].Port,
+	}
+	pooled, err := pool.Acquire(context.Background(), sig, "harness-selftest")
+	require.NoError(t, err)
+	defer func() { _ = pool.Release(pooled, "harness-selftest") }()
+
+	session, err := pooled.Client.NewSession()
+	require.NoError(t, err)
+	defer func() { _ = session.Close() }()
+
+	out, err := session.CombinedOutput("probe-cmd")
+	require.NoError(t, err)
+	assert.Equal(t, "OCCUPIED", string(out))
+	assert.Equal(t, 1, server.sessionOpens())
 }
