@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -49,6 +50,7 @@ type testSSHServer struct {
 	mu            sync.Mutex
 	listeners     map[string]net.Listener
 	rejectForward bool
+	cancelCount   int
 
 	sessionOutput string
 	sessionRC     int
@@ -108,6 +110,33 @@ func (s *testSSHServer) sessionOpens() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sessionCount
+}
+
+// heldForwards returns the keys of the remote listeners this server currently
+// holds, sorted for stable comparison.
+func (s *testSSHServer) heldForwards() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := make([]string, 0, len(s.listeners))
+	for k := range s.listeners {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// cancelRequests counts cancel-tcpip-forward requests received, regardless
+// of whether the reply was true or false.
+func (s *testSSHServer) cancelRequests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancelCount
+}
+
+// forwardKey is the single key form shared by tcpip-forward accounting and
+// cancel lookups: both must derive identical keys or cancels miss.
+func forwardKey(addr string, port uint32) string {
+	return fmt.Sprintf("%s:%d", addr, port)
 }
 
 func (s *testSSHServer) Close() {
@@ -215,6 +244,9 @@ func (s *testSSHServer) handleRequests(srvConn *ssh.ServerConn, reqs <-chan *ssh
 		case "tcpip-forward":
 			s.handleTCPForward(srvConn, req)
 		case "cancel-tcpip-forward":
+			s.mu.Lock()
+			s.cancelCount++
+			s.mu.Unlock()
 			var p tcpipForwardReqMsg
 			if err := ssh.Unmarshal(req.Payload, &p); err != nil {
 				if req.WantReply {
@@ -222,7 +254,9 @@ func (s *testSSHServer) handleRequests(srvConn *ssh.ServerConn, reqs <-chan *ssh
 				}
 				continue
 			}
-			key := fmt.Sprintf("%s:%d", p.Addr, p.Port)
+			// Real sshd semantics: a cancel only succeeds for a listener this
+			// session actually holds; anything else answers false.
+			key := forwardKey(p.Addr, p.Port)
 			s.mu.Lock()
 			l, ok := s.listeners[key]
 			if ok {
@@ -233,7 +267,7 @@ func (s *testSSHServer) handleRequests(srvConn *ssh.ServerConn, reqs <-chan *ssh
 				_ = l.Close()
 			}
 			if req.WantReply {
-				_ = req.Reply(true, nil)
+				_ = req.Reply(ok, nil)
 			}
 		default:
 			// Covers keepalive@openssh.com (sent by the connection pool) etc.
@@ -263,8 +297,13 @@ func (s *testSSHServer) handleTCPForward(srvConn *ssh.ServerConn, req *ssh.Reque
 		return
 	}
 
-	// Always bind 127.0.0.1:0; let the kernel pick an ephemeral port.
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	// Real sshd semantics: an explicit port (p.Port != 0) must bind the
+	// requested address, and a bind failure (port occupied) is the deny
+	// path. Port 0 keeps the old behavior: the kernel picks a port and the
+	// allocated port is reported in the reply (x/crypto adopts the reply
+	// port client-side only when it asked for 0).
+	listenAddr := fmt.Sprintf("%s:%d", p.Addr, p.Port)
+	l, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		if req.WantReply {
 			_ = req.Reply(false, nil)
@@ -273,10 +312,11 @@ func (s *testSSHServer) handleTCPForward(srvConn *ssh.ServerConn, req *ssh.Reque
 	}
 
 	boundPort := uint32(l.Addr().(*net.TCPAddr).Port)
-	// Key by the bound port: x/crypto sends cancel-tcpip-forward with the
-	// allocated port (from the reply), not the requested one (real sshd does the same).
+	// Record under the same key form cancel lookups use: for explicit ports
+	// the bound port IS the requested port; for port 0 it is the allocated
+	// port the reply reports (matching x/crypto's adopted entry).
 	s.mu.Lock()
-	s.listeners[fmt.Sprintf("%s:%d", p.Addr, boundPort)] = l
+	s.listeners[forwardKey(p.Addr, boundPort)] = l
 	s.mu.Unlock()
 
 	if req.WantReply {

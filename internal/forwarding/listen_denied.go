@@ -42,6 +42,15 @@ const listenDeniedMarker = "denied by peer"
 const cancelUndeliveredWarn = "cancel-tcpip-forward delivery not confirmed; " +
 	"same-port forward requests may be denied until the remote releases the listener"
 
+// listenClassification is the internal outcome of the remote port probe.
+type listenClassification int
+
+const (
+	listenOccupied listenClassification = iota
+	listenPolicyFree
+	listenUnknown
+)
+
 // annotateListenDenied enriches a denied tcpip-forward failure with a
 // best-effort remote port-state probe so the operator can act on the error:
 // a stale listener (restarting this daemon may free it) vs an sshd policy
@@ -58,32 +67,68 @@ func annotateListenDenied(client *ssh.Client, bindAddr string, cause error) erro
 		return cause
 	}
 
-	detail := probeDeniedPort(client, bindAddr)
+	detail, _ := probeDeniedPort(client, bindAddr)
 	return fmt.Errorf("%w (%s)", cause, detail)
 }
 
 // probeDeniedPort runs the remote probe and returns the human-readable
-// classification appended to the error.
-func probeDeniedPort(client *ssh.Client, bindAddr string) string {
+// classification appended to the error, plus the machine-readable class the
+// deny-recovery branch dispatches on.
+func probeDeniedPort(client *ssh.Client, bindAddr string) (string, listenClassification) {
 	port, err := parsePort(bindAddr)
 	if err != nil {
-		return fmt.Sprintf("could not verify remote port state: %v", err)
+		return fmt.Sprintf("could not verify remote port state: %v", err), listenUnknown
 	}
 
 	out, err := runRemoteProbe(client, fmt.Sprintf(denyProbeCmdTmpl, port))
 	switch {
 	case err != nil:
-		return fmt.Sprintf("could not verify remote port state: %v", err)
+		return fmt.Sprintf("could not verify remote port state: %v", err), listenUnknown
 	case strings.Contains(out, "OCCUPIED"):
 		return fmt.Sprintf("remote port %s is already in LISTEN state — likely a stale listener "+
 			"from a previous dead session (restarting this daemon may free it) or another service "+
-			"on the remote host; SSH cannot release it", bindAddr)
+			"on the remote host; SSH cannot release it", bindAddr), listenOccupied
 	case strings.Contains(out, "UNKNOWN"):
-		return "could not verify remote port state: remote host has no ss/netstat and no /proc"
+		return "could not verify remote port state: remote host has no ss/netstat and no /proc", listenUnknown
 	default:
 		return fmt.Sprintf("remote port %s has no listener — the remote sshd is refusing "+
-			"tcpip-forward, likely AllowTcpForwarding or PermitListen policy", bindAddr)
+			"tcpip-forward, likely AllowTcpForwarding or PermitListen policy", bindAddr), listenPolicyFree
 	}
+}
+
+// cancelRemoteListener asks the remote sshd to retract the tcpip-forward
+// listener for bindAddr on THIS connection's session and reports whether it
+// held one. bindAddr must be byte-identical to the string previously passed
+// to Client.Listen: x/crypto sends the host unresolved and the sshd matches
+// the cancel against the exact recorded address.
+func cancelRemoteListener(client *ssh.Client, bindAddr string) (bool, error) {
+	_, portStr, err := net.SplitHostPort(bindAddr)
+	if err != nil {
+		return false, fmt.Errorf("invalid bind address %q: %w", bindAddr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return false, fmt.Errorf("invalid port %q", portStr)
+	}
+	payload := ssh.Marshal(struct {
+		Addr string
+		Port uint32
+	}{hostOf(bindAddr), uint32(port)})
+	ok, _, err := client.SendRequest("cancel-tcpip-forward", true, payload)
+	if err != nil {
+		return false, fmt.Errorf("cancel-tcpip-forward %s: %w", bindAddr, err)
+	}
+	return ok, nil
+}
+
+// hostOf returns the host part of bindAddr verbatim (no normalization),
+// mirroring what x/crypto's Listen puts on the wire.
+func hostOf(bindAddr string) string {
+	host, _, err := net.SplitHostPort(bindAddr)
+	if err != nil {
+		return ""
+	}
+	return host
 }
 
 // parsePort extracts and validates the port from a bind address. The value is
