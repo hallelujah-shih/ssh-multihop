@@ -647,10 +647,15 @@ func (s *ForwardService) GetPoolStats() (map[string]interface{}, error) {
 }
 
 // leakRecoveryAllowed reports whether fwd may attempt deny-branch cancel
-// recovery. Disabled when another running forward (rll/rlr — they hold the
-// remote listen) normalizes to the same listen bind: two records sharing one
-// remote bind must not retract each other's listener (flip-flop). A failed
-// listing also disables recovery — a flip-flop is worse than no auto-heal.
+// recovery. A same-bind sibling (rll/rlr — they hold the remote listen)
+// occupies the bind unless it is fully stopped: running is the obvious
+// conflict, while pending/error — and a start still in flight in
+// pendingStarts — cover the concurrent-start window where two records would
+// retract each other's listener (flip-flop). A bind that fails to normalize
+// on either side makes the comparison undecidable and also counts as
+// occupied; raw strings are never compared, since "localhost:p" and
+// "127.0.0.1:p" are unequal strings for the same port. A failed listing
+// disables recovery outright — a flip-flop is worse than no auto-heal.
 func (s *ForwardService) leakRecoveryAllowed(fwd *db.Forward) bool {
 	all, err := s.db.ListForwardsWithStatus()
 	if err != nil {
@@ -670,48 +675,51 @@ func (s *ForwardService) leakRecoveryAllowed(fwd *db.Forward) bool {
 		if other.Type != string(db.RemoteListenToLocal) && other.Type != string(db.RemoteListenToRemote) {
 			continue
 		}
-		if other.Status == nil || *other.Status != "running" {
+		if myErr != nil {
+			// Self bind unparseable: undecidable against this sibling.
+			return false
+		}
+		host, port, otherErr := util.ParseAddress(other.ListenAddr)
+		if otherErr != nil {
+			// Sibling bind unparseable: undecidable comparison.
+			return false
+		}
+		if host != myHost || port != myPort {
 			continue
 		}
-		if host, port, otherErr := util.ParseAddress(other.ListenAddr); myErr == nil && otherErr == nil {
-			if host == myHost && port == myPort {
-				return false
-			}
-			continue
+		if other.Status == nil || *other.Status != "stopped" {
+			return false
 		}
-		// Either side failed to parse: fall back to raw string comparison.
-		if other.ListenAddr == fwd.ListenAddr {
+		s.pendingMu.Lock()
+		inFlight := s.pendingStarts[other.ForwardID]
+		s.pendingMu.Unlock()
+		if inFlight {
 			return false
 		}
 	}
 	return true
 }
 
-// startForward starts a single forward
-func (s *ForwardService) startForward(fwd *db.Forward) error {
-	zap.L().Debug("Starting forward",
-		zap.String("type", string(fwd.Type)),
-		zap.String("listen_host", fwd.ListenHost),
-		zap.String("listen_addr", fwd.ListenAddr),
-		zap.String("service_host", fwd.ServiceHost),
-		zap.String("service_addr", fwd.ServiceAddr))
-
+// buildForward constructs the concrete forward for fwd. For the
+// remote-listening types (rll/rlr) it wires the sibling guard into
+// AllowLeakRecovery; llr holds no remote listen and never opts in.
+func (s *ForwardService) buildForward(fwd *db.Forward) (forwarding.Forward, error) {
 	// Parse listen address
 	listenIP, listenPort, err := util.ParseAddress(fwd.ListenAddr)
 	if err != nil {
-		return fmt.Errorf("invalid listen_addr: %w", err)
+		return nil, fmt.Errorf("invalid listen_addr: %w", err)
 	}
 
 	// Parse service address (servicePort used by RemoteListenToRemote)
 	_, servicePort, err := util.ParseAddress(fwd.ServiceAddr)
 	if err != nil {
-		return fmt.Errorf("invalid service_addr: %w", err)
+		return nil, fmt.Errorf("invalid service_addr: %w", err)
 	}
 
 	// Resolve listen_host to get SSH hops
 	listenHops, err := s.getHopsForHost(fwd.ListenHost)
 	if err != nil {
-		return fmt.Errorf("failed to resolve listen_host: %w", err)
+		return nil, fmt.Errorf("failed to resolve listen_host: %w", err)
 	}
 
 	// For local_listen_to_remote and remote_listen_to_remote, also need service_host hops
@@ -719,28 +727,24 @@ func (s *ForwardService) startForward(fwd *db.Forward) error {
 	if fwd.Type == db.LocalListenToRemote || fwd.Type == db.RemoteListenToRemote {
 		serviceHops, err = s.getHopsForHost(fwd.ServiceHost)
 		if err != nil {
-			return fmt.Errorf("failed to resolve service_host: %w", err)
+			return nil, fmt.Errorf("failed to resolve service_host: %w", err)
 		}
 	}
 
 	// Build bind address string
 	bindAddr := fmt.Sprintf("%s:%d", listenIP, listenPort)
 
-	var wrapper ForwardWrapper
-
 	switch fwd.Type {
 	case db.LocalListenToRemote:
 		// For SSH -L forwarding, use the full service address from database
-		wrapper = ForwardWrapper{
-			Forward: forwarding.NewLocalListenToRemote(
-				bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
-				fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
-				fwd.ID,
-				s.db,
-				s.pool, // Connection pool for SSH connection reuse
-				serviceHops,
-			),
-		}
+		return forwarding.NewLocalListenToRemote(
+			bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
+			fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
+			fwd.ID,
+			s.db,
+			s.pool, // Connection pool for SSH connection reuse
+			serviceHops,
+		), nil
 
 	case db.RemoteListenToLocal:
 		rf := forwarding.NewRemoteListenToLocal(
@@ -754,9 +758,7 @@ func (s *ForwardService) startForward(fwd *db.Forward) error {
 		// Sibling guard: two records on the same remote bind must not
 		// retract each other's listener (flip-flop).
 		rf.AllowLeakRecovery = s.leakRecoveryAllowed(fwd)
-		wrapper = ForwardWrapper{
-			Forward: rf,
-		}
+		return rf, nil
 
 	case db.RemoteListenToRemote:
 		inf := forwarding.NewRemoteListenToRemote(
@@ -775,13 +777,28 @@ func (s *ForwardService) startForward(fwd *db.Forward) error {
 		)
 		// Sibling guard: same as rll (see above).
 		inf.AllowLeakRecovery = s.leakRecoveryAllowed(fwd)
-		wrapper = ForwardWrapper{
-			Forward: inf,
-		}
+		return inf, nil
 
 	default:
-		return fmt.Errorf("unknown forward type: %s", fwd.Type)
+		return nil, fmt.Errorf("unknown forward type: %s", fwd.Type)
 	}
+}
+
+// startForward starts a single forward
+func (s *ForwardService) startForward(fwd *db.Forward) error {
+	zap.L().Debug("Starting forward",
+		zap.String("type", string(fwd.Type)),
+		zap.String("listen_host", fwd.ListenHost),
+		zap.String("listen_addr", fwd.ListenAddr),
+		zap.String("service_host", fwd.ServiceHost),
+		zap.String("service_addr", fwd.ServiceAddr))
+
+	forward, err := s.buildForward(fwd)
+	if err != nil {
+		return err
+	}
+
+	wrapper := ForwardWrapper{Forward: forward}
 
 	// Create context for this forward
 	ctx, cancel := context.WithCancel(s.ctx)
