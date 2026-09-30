@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -250,4 +251,77 @@ func TestRemoteListenToLocal_LeakRecoveryOffByDefault(t *testing.T) {
 	assert.Equal(t, before, server.cancelRequests(), "default path must not send cancel")
 
 	_ = leaked.Close() // 同 R2 P0-2 收尾
+}
+
+func TestRemoteListenToLocal_E2EProbeHealthyKeepsRunning(t *testing.T) {
+	zap.ReplaceGlobals(zap.NewNop())
+
+	server := newTestSSHServer(t) // default exec output: E2E_OPEN
+	pool, hops := newTestConnectionManager(t, server)
+	db := db.NewTestDB(t)
+	shrinkE2EProbeTimeout(t, 50*time.Millisecond)
+
+	rf := NewRemoteListenToLocal("127.0.0.1:0", "127.0.0.1:22", "e2e-rll-healthy", db, pool, hops)
+	rf.e2eInterval = 100 * time.Millisecond
+	require.NoError(t, rf.Start(t.Context()))
+	defer func() { _ = rf.Stop() }()
+
+	// Fixed wait ≥5×interval: several probes must have run and left us running.
+	time.Sleep(700 * time.Millisecond)
+	assert.Equal(t, StatusRunning, rf.Status())
+}
+
+func TestRemoteListenToLocal_E2EProbeFailDies(t *testing.T) {
+	zap.ReplaceGlobals(zap.NewNop())
+
+	server := newTestSSHServer(t)
+	server.setSessionOutput("E2E_FAIL", 0)
+	pool, hops := newTestConnectionManager(t, server)
+	testDB := db.NewTestDB(t)
+	shrinkE2EProbeTimeout(t, 50*time.Millisecond)
+
+	forwardID := "e2e-rll-fail"
+	rf := NewRemoteListenToLocal("127.0.0.1:0", "127.0.0.1:22", forwardID, testDB, pool, hops)
+	rf.e2eInterval = 100 * time.Millisecond
+	require.NoError(t, rf.Start(t.Context()))
+	remotePort := rf.listener.Addr().(*net.TCPAddr).Port
+
+	waitFor(t, 2*time.Second, func() bool {
+		return rf.Status() == StatusError
+	})
+
+	status, err := testDB.GetStatus(forwardID)
+	require.NoError(t, err)
+	assert.Equal(t, "error", status.Status)
+	assert.True(t, strings.HasPrefix(status.ErrorMessage, "e2e probe failed"),
+		"error_message must carry the e2e prefix, got %q", status.ErrorMessage)
+
+	// The failure path cancels the context: the remote listener must go away.
+	waitFor(t, 2*time.Second, func() bool {
+		c, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", remotePort), 200*time.Millisecond)
+		if derr != nil {
+			return true
+		}
+		_ = c.Close()
+		return false
+	})
+}
+
+func TestRemoteListenToLocal_E2EProbeUnknownKeepsRunning(t *testing.T) {
+	zap.ReplaceGlobals(zap.NewNop())
+
+	server := newTestSSHServer(t)
+	server.setSessionDelay(1 * time.Second) // exec slower than the shrunk probe timeout
+	pool, hops := newTestConnectionManager(t, server)
+	db := db.NewTestDB(t)
+	shrinkE2EProbeTimeout(t, 50*time.Millisecond)
+
+	rf := NewRemoteListenToLocal("127.0.0.1:0", "127.0.0.1:22", "e2e-rll-unknown", db, pool, hops)
+	rf.e2eInterval = 100 * time.Millisecond
+	require.NoError(t, rf.Start(t.Context()))
+	defer func() { _ = rf.Stop() }()
+
+	// Fixed wait >probeTimeout+2×interval: unknown verdicts must not touch state.
+	time.Sleep(700 * time.Millisecond)
+	assert.Equal(t, StatusRunning, rf.Status())
 }
