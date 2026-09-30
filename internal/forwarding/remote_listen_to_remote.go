@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +60,13 @@ type RemoteListenToRemote struct {
 
 	// Configuration
 	maxConns int
+
+	// AllowLeakRecovery opts this forward into deny-branch leak recovery on
+	// the source listen: when the remote port probe classifies a start-deny
+	// as occupied, a cancel-tcpip-forward is sent on THIS session to retract
+	// a leaked listener and Listen is retried once. Default false keeps the
+	// batch-1 behavior byte-for-byte. Set by ForwardService's sibling guard.
+	AllowLeakRecovery bool
 
 	// Health monitoring
 	healthCheckInterval time.Duration
@@ -208,14 +216,49 @@ func (inf *RemoteListenToRemote) Start(ctx context.Context) error {
 	// Listen on sourceAddr (e.g., "127.0.0.1:11434") through SSH connection
 	listener, err := sourcePooledConn.Client.Listen("tcp", inf.sourceAddr)
 	if err != nil {
-		annotated := annotateListenDenied(sourcePooledConn.Client, inf.sourceAddr, err)
-		_ = inf.pool.Release(sourcePooledConn, inf.forwardID)
-		_ = inf.pool.Release(targetPooledConn, inf.forwardID)
-		zap.L().Error("Failed to listen on source",
-			zap.String("forward", inf.String()),
-			zap.String("source_listen", inf.sourceAddr),
-			zap.Error(annotated))
-		return fmt.Errorf("failed to create listener: %w", annotated)
+		annotated := err
+		if strings.Contains(err.Error(), listenDeniedMarker) {
+			detail, cls := probeDeniedPort(sourcePooledConn.Client, inf.sourceAddr)
+			if cls == listenOccupied && inf.AllowLeakRecovery {
+				released, cerr := cancelRemoteListener(sourcePooledConn.Client, inf.sourceAddr)
+				if released {
+					// Single retry on the same session: the leaked listener
+					// was retracted, so the bind should succeed now.
+					listener, err = sourcePooledConn.Client.Listen("tcp", inf.sourceAddr)
+					if err == nil {
+						zap.L().Info("Leak recovery: retracted leaked remote listener, re-listen succeeded",
+							zap.String("forward", inf.String()),
+							zap.String("source_listen", inf.sourceAddr))
+					} else {
+						detail += "; cancel-tcpip-forward released the port but re-listen failed"
+						zap.L().Warn("Leak recovery retry failed",
+							zap.String("forward", inf.String()),
+							zap.Error(err))
+					}
+				} else {
+					detail += "; cancel-tcpip-forward attempted, released=false"
+					if cerr != nil {
+						detail += fmt.Sprintf(" (%v)", cerr)
+					}
+					zap.L().Warn("Leak recovery: cancel did not release the remote port",
+						zap.String("forward", inf.String()),
+						zap.String("source_listen", inf.sourceAddr),
+						zap.Error(cerr))
+				}
+			}
+			if err != nil {
+				annotated = annotateDeniedWith(err, detail)
+			}
+		}
+		if err != nil {
+			_ = inf.pool.Release(sourcePooledConn, inf.forwardID)
+			_ = inf.pool.Release(targetPooledConn, inf.forwardID)
+			zap.L().Error("Failed to listen on source",
+				zap.String("forward", inf.String()),
+				zap.String("source_listen", inf.sourceAddr),
+				zap.Error(annotated))
+			return fmt.Errorf("failed to create listener: %w", annotated)
+		}
 	}
 
 	// Success! Store resources and start forward

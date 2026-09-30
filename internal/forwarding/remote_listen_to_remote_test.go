@@ -369,6 +369,47 @@ func TestRemoteListenToRemote_TwoDistinctSignatures(t *testing.T) {
 	assert.Equal(t, "dc4.example.com", targetSig.Hostname)
 }
 
+// TestRemoteListenToRemote_LeakHeal: the rlr source-side twin of
+// TestRemoteListenToLocal_LeakHeal, assembled like
+// TestRemoteListenToRemote_DenyPrefix (single server, both hops on it).
+// Same R2 P0-1/P0-2 constraints: OCCUPIED probe output, explicit source
+// port, and leaked.Close() BEFORE Stop.
+func TestRemoteListenToRemote_LeakHeal(t *testing.T) {
+	server := newTestSSHServer(t) // 非 reject 模式；占用仿真生效
+	server.setSessionOutput("OCCUPIED", 0)
+	pool, hops := newTestConnectionManager(t, server)
+
+	sig := connection.ConnectionSignature{
+		Username: hops[0].User,
+		Hostname: hops[0].HostName,
+		Port:     hops[0].Port,
+	}
+	pooled, err := pool.Acquire(t.Context(), sig, "leak-seed-rlr")
+	require.NoError(t, err)
+	// Seed the leak on the source side without ever cancelling (lost
+	// cancel-tcpip-forward). The client-side entry stays until
+	// leaked.Close() below (R2 P0-2 sequencing).
+	leaked, err := pooled.Client.Listen("tcp", "127.0.0.1:23458")
+	require.NoError(t, err)
+
+	inf := NewRemoteListenToRemote("127.0.0.1:23458", "testdouble", 23458, hops,
+		"127.0.0.1:9999", "testdouble", 9999, hops,
+		"leak-heal-rlr", db.NewTestDB(t), pool, 0)
+	inf.AllowLeakRecovery = true
+	require.NoError(t, inf.Start(t.Context()))
+
+	// Heal assertions: one cancel request was sent; the only held forward
+	// left is inf's own (the seed was retracted).
+	assert.Equal(t, 1, server.cancelRequests())
+	held := server.heldForwards()
+	assert.Len(t, held, 1, "leaked listener must be retracted, inf's own remains")
+
+	// R2 P0-2: retract the seed's client-side entry BEFORE Stop so
+	// forwardList.remove hits the seed entry, not inf's own.
+	_ = leaked.Close()
+	require.NoError(t, inf.Stop())
+}
+
 // TestRemoteListenToRemote_MultiHopJumpChain verifies multi-hop jump chain building
 func TestRemoteListenToRemote_MultiHopJumpChain(t *testing.T) {
 	hops := []*tunnel.HopConfig{

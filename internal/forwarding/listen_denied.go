@@ -51,6 +51,12 @@ const (
 	listenUnknown
 )
 
+// annotateDeniedWith is the single assembly point for deny error text.
+// Batch-1 text: "<cause> (<detail>)" — byte-stable, grep-depended-on.
+func annotateDeniedWith(cause error, detail string) error {
+	return fmt.Errorf("%w (%s)", cause, detail)
+}
+
 // annotateListenDenied enriches a denied tcpip-forward failure with a
 // best-effort remote port-state probe so the operator can act on the error:
 // a stale listener (restarting this daemon may free it) vs an sshd policy
@@ -68,7 +74,7 @@ func annotateListenDenied(client *ssh.Client, bindAddr string, cause error) erro
 	}
 
 	detail, _ := probeDeniedPort(client, bindAddr)
-	return fmt.Errorf("%w (%s)", cause, detail)
+	return annotateDeniedWith(cause, detail)
 }
 
 // probeDeniedPort runs the remote probe and returns the human-readable
