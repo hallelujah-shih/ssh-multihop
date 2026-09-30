@@ -5,10 +5,12 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -57,6 +59,10 @@ type testSSHServer struct {
 	sessionDelay  time.Duration
 	sessionCount  int
 
+	directTCPDialFail         bool
+	directTCPRejectProhibited bool
+	sessionRealExec           bool
+
 	wg sync.WaitGroup
 }
 
@@ -71,11 +77,14 @@ func newTestSSHServer(t *testing.T) *testSSHServer {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
+	// sessionOutput defaults to the healthy-world E2E probe verdict so every
+	// forward started against this testdouble lives in a healthy probe world.
 	s := &testSSHServer{
-		t:         t,
-		listener:  l,
-		hostKey:   signer,
-		listeners: make(map[string]net.Listener),
+		t:             t,
+		listener:      l,
+		hostKey:       signer,
+		listeners:     make(map[string]net.Listener),
+		sessionOutput: "E2E_OPEN",
 	}
 
 	s.wg.Add(1)
@@ -104,6 +113,24 @@ func (s *testSSHServer) setSessionDelay(d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessionDelay = d
+}
+
+func (s *testSSHServer) setDirectTCPDialFail(b bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.directTCPDialFail = b
+}
+
+func (s *testSSHServer) setDirectTCPRejectProhibited(b bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.directTCPRejectProhibited = b
+}
+
+func (s *testSSHServer) setSessionRealExec(b bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionRealExec = b
 }
 
 func (s *testSSHServer) sessionOpens() int {
@@ -193,19 +220,22 @@ func (s *testSSHServer) handleConn(conn net.Conn) {
 
 	go s.handleRequests(srvConn, reqs)
 	for ch := range chans {
-		if ch.ChannelType() == "session" {
+		switch ch.ChannelType() {
+		case "session":
 			s.handleSession(ch)
-			continue
+		case "direct-tcpip":
+			s.handleDirectTCPIP(ch)
+		default:
+			// Unknown channel types are rejected, matching real sshd behavior.
+			_ = ch.Reject(ssh.UnknownChannelType, "unexpected client channel")
 		}
-		// Unknown channel types are rejected, matching real sshd behavior.
-		_ = ch.Reject(ssh.UnknownChannelType, "unexpected client channel")
 	}
 }
 
 func (s *testSSHServer) handleSession(ch ssh.NewChannel) {
 	s.mu.Lock()
 	s.sessionCount++
-	out, rc, delay := s.sessionOutput, s.sessionRC, s.sessionDelay
+	out, rc, delay, realExec := s.sessionOutput, s.sessionRC, s.sessionDelay, s.sessionRealExec
 	s.mu.Unlock()
 
 	channel, reqs, err := ch.Accept()
@@ -226,6 +256,11 @@ func (s *testSSHServer) handleSession(ch ssh.NewChannel) {
 			_ = req.Reply(false, nil)
 			continue
 		}
+		if realExec {
+			_ = req.Reply(true, nil)
+			s.runRealExec(channel, p.Command)
+			return
+		}
 		if delay > 0 {
 			time.Sleep(delay)
 		}
@@ -236,6 +271,71 @@ func (s *testSSHServer) handleSession(ch ssh.NewChannel) {
 		_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(rc)}))
 		return
 	}
+}
+
+// runRealExec executes the command with the local shell and pipes output back
+// over the channel, so tests can drive the real probe command end to end
+// instead of a canned output that has no discriminating power over the
+// command string.
+func (s *testSSHServer) runRealExec(channel ssh.Channel, command string) {
+	cmd := exec.Command("bash", "-c", command)
+	cmd.Stdout = channel
+	cmd.Stderr = channel
+	rc := 0
+	if err := cmd.Run(); err != nil {
+		rc = 1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() > 0 {
+			rc = exitErr.ExitCode()
+		}
+	}
+	_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(rc)}))
+}
+
+// directTCPIPMsg mirrors x/crypto/ssh's wire payload for direct-tcpip opens.
+type directTCPIPMsg struct {
+	Addr       string
+	Port       uint32
+	OriginAddr string
+	OriginPort uint32
+}
+
+// handleDirectTCPIP accepts direct-tcpip opens, dials the requested address
+// and relays both ways (healthy world). The fault switches emulate sshd-side
+// outcomes: dial failure (ConnectionFailed reject) and PermitOpen policy
+// refusal (Prohibited reject).
+func (s *testSSHServer) handleDirectTCPIP(ch ssh.NewChannel) {
+	s.mu.Lock()
+	dialFail := s.directTCPDialFail
+	prohibited := s.directTCPRejectProhibited
+	s.mu.Unlock()
+
+	if prohibited {
+		_ = ch.Reject(ssh.Prohibited, "administratively prohibited")
+		return
+	}
+	if dialFail {
+		_ = ch.Reject(ssh.ConnectionFailed, "connect failed")
+		return
+	}
+
+	var p directTCPIPMsg
+	if err := ssh.Unmarshal(ch.ExtraData(), &p); err != nil {
+		_ = ch.Reject(ssh.ConnectionFailed, "bad payload")
+		return
+	}
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", p.Addr, p.Port), 2*time.Second)
+	if err != nil {
+		_ = ch.Reject(ssh.ConnectionFailed, "connect failed")
+		return
+	}
+	channel, reqs, err := ch.Accept()
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	go s.relay(channel, conn)
 }
 
 func (s *testSSHServer) handleRequests(srvConn *ssh.ServerConn, reqs <-chan *ssh.Request) {
