@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/hallelujah-shih/ssh-multihop/internal/db"
 	"github.com/hallelujah-shih/ssh-multihop/internal/forwarding"
@@ -237,4 +238,83 @@ func TestSync_DoesNotRebuildHealthyForward(t *testing.T) {
 
 	// Errored peer did go through rebuild (sanity check the test exercised it).
 	assert.Equal(t, 1, erroredFake.stopCalls())
+}
+
+// setForwardStatus writes a status row for a forward, as the sync loop would.
+func setForwardStatus(t *testing.T, database *db.Database, id, status string) {
+	t.Helper()
+	require.NoError(t, database.CreateOrUpdateStatus(&db.ForwardStatus{
+		ForwardID:     id,
+		Status:        status,
+		LastHeartbeat: time.Now(),
+	}))
+}
+
+// TestLeakRecoveryAllowed_SiblingGuard pins the flip-flop guard: a running
+// sibling that normalizes to the same listen bind must disable leak
+// recovery, so two records sharing one remote bind cannot retract each
+// other's listener. ":p" and "0.0.0.0:p" must normalize equal (R1 P2-5).
+func TestLeakRecoveryAllowed_SiblingGuard(t *testing.T) {
+	database := setupTestDB(t)
+	svc, err := New(database)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = svc.Stop() })
+
+	port := freePort(t)
+	f1 := &db.Forward{Type: db.RemoteListenToLocal, ListenHost: "local",
+		ListenAddr: fmt.Sprintf(":%d", port), ServiceHost: "local", ServiceAddr: "127.0.0.1:1"}
+	f2 := &db.Forward{Type: db.RemoteListenToLocal, ListenHost: "local",
+		ListenAddr: fmt.Sprintf("0.0.0.0:%d", port), ServiceHost: "local", ServiceAddr: "127.0.0.1:1"}
+	f3 := &db.Forward{Type: db.RemoteListenToLocal, ListenHost: "local",
+		ListenAddr: fmt.Sprintf("127.0.0.1:%d", freePort(t)), ServiceHost: "local", ServiceAddr: "127.0.0.1:1"}
+	require.NoError(t, database.CreateForward(f1))
+	require.NoError(t, database.CreateForward(f2))
+	require.NoError(t, database.CreateForward(f3))
+
+	// f2 running on the same bind (after normalization) ⇒ f1 must not recover.
+	setForwardStatus(t, database, f2.ID, "running")
+	assert.False(t, svc.leakRecoveryAllowed(f1), "running sibling on the same bind must disable recovery")
+
+	// f3: no same-bind sibling (its only sibling is on another port) ⇒ allowed.
+	setForwardStatus(t, database, f1.ID, "running")
+	assert.True(t, svc.leakRecoveryAllowed(f3), "no same-bind sibling must keep recovery enabled")
+
+	// f2 not running anymore ⇒ f1 allowed again.
+	setForwardStatus(t, database, f2.ID, "stopped")
+	assert.True(t, svc.leakRecoveryAllowed(f1), "non-running sibling must keep recovery enabled")
+}
+
+// TestLeakRecoveryAllowed_TypeScope: an llr sibling on the same ListenAddr
+// must not disable recovery — llr binds locally and holds no remote listen,
+// so there is nothing it could flip-flop against.
+func TestLeakRecoveryAllowed_TypeScope(t *testing.T) {
+	database := setupTestDB(t)
+	svc, err := New(database)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = svc.Stop() })
+
+	addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	rll := &db.Forward{Type: db.RemoteListenToLocal, ListenHost: "local",
+		ListenAddr: addr, ServiceHost: "local", ServiceAddr: "127.0.0.1:1"}
+	llr := &db.Forward{Type: db.LocalListenToRemote, ListenHost: "local",
+		ListenAddr: addr, ServiceHost: "local", ServiceAddr: "127.0.0.1:1"}
+	require.NoError(t, database.CreateForward(rll))
+	require.NoError(t, database.CreateForward(llr))
+	setForwardStatus(t, database, llr.ID, "running")
+
+	assert.True(t, svc.leakRecoveryAllowed(rll), "running llr sibling on the same bind must not disable recovery")
+}
+
+// TestLeakRecoveryAllowed_DBFailure: a failed forward listing must
+// conservatively disable recovery — a flip-flop is worse than no auto-heal.
+func TestLeakRecoveryAllowed_DBFailure(t *testing.T) {
+	database := setupTestDB(t)
+	svc, err := New(database)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = svc.Stop() })
+	require.NoError(t, database.Close())
+
+	fwd := &db.Forward{Type: db.RemoteListenToLocal, ListenHost: "local",
+		ListenAddr: "127.0.0.1:23458", ServiceHost: "local", ServiceAddr: "127.0.0.1:1"}
+	assert.False(t, svc.leakRecoveryAllowed(fwd), "db failure must conservatively disable recovery")
 }

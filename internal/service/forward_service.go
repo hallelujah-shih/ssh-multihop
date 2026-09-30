@@ -646,6 +646,47 @@ func (s *ForwardService) GetPoolStats() (map[string]interface{}, error) {
 	}, nil
 }
 
+// leakRecoveryAllowed reports whether fwd may attempt deny-branch cancel
+// recovery. Disabled when another running forward (rll/rlr — they hold the
+// remote listen) normalizes to the same listen bind: two records sharing one
+// remote bind must not retract each other's listener (flip-flop). A failed
+// listing also disables recovery — a flip-flop is worse than no auto-heal.
+func (s *ForwardService) leakRecoveryAllowed(fwd *db.Forward) bool {
+	all, err := s.db.ListForwardsWithStatus()
+	if err != nil {
+		zap.L().Warn("Leak recovery guard: cannot list forwards, disabling recovery",
+			zap.String("forward_id", fwd.ID),
+			zap.Error(err))
+		return false
+	}
+
+	myHost, myPort, myErr := util.ParseAddress(fwd.ListenAddr)
+	for _, other := range all {
+		if other.ForwardID == fwd.ID {
+			continue
+		}
+		// ForwardWithStatus.Type is a plain string; compare against the
+		// remote-listening types only.
+		if other.Type != string(db.RemoteListenToLocal) && other.Type != string(db.RemoteListenToRemote) {
+			continue
+		}
+		if other.Status == nil || *other.Status != "running" {
+			continue
+		}
+		if host, port, otherErr := util.ParseAddress(other.ListenAddr); myErr == nil && otherErr == nil {
+			if host == myHost && port == myPort {
+				return false
+			}
+			continue
+		}
+		// Either side failed to parse: fall back to raw string comparison.
+		if other.ListenAddr == fwd.ListenAddr {
+			return false
+		}
+	}
+	return true
+}
+
 // startForward starts a single forward
 func (s *ForwardService) startForward(fwd *db.Forward) error {
 	zap.L().Debug("Starting forward",
@@ -702,33 +743,40 @@ func (s *ForwardService) startForward(fwd *db.Forward) error {
 		}
 
 	case db.RemoteListenToLocal:
+		rf := forwarding.NewRemoteListenToLocal(
+			bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
+			fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
+			fwd.ID,
+			s.db,
+			s.pool, // Connection pool for SSH connection reuse
+			listenHops,
+		)
+		// Sibling guard: two records on the same remote bind must not
+		// retract each other's listener (flip-flop).
+		rf.AllowLeakRecovery = s.leakRecoveryAllowed(fwd)
 		wrapper = ForwardWrapper{
-			Forward: forwarding.NewRemoteListenToLocal(
-				bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
-				fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
-				fwd.ID,
-				s.db,
-				s.pool, // Connection pool for SSH connection reuse
-				listenHops,
-			),
+			Forward: rf,
 		}
 
 	case db.RemoteListenToRemote:
+		inf := forwarding.NewRemoteListenToRemote(
+			fwd.ListenAddr, // Full listen address (e.g., "127.0.0.1:11434")
+			fwd.ListenHost, // SSH hostname (e.g., "vmr.u24")
+			listenPort,     // Port number
+			listenHops,
+			fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:11434")
+			fwd.ServiceHost, // SSH hostname (e.g., "dc4")
+			servicePort,     // Port number
+			serviceHops,
+			fwd.ID,
+			s.db,
+			s.pool, // Connection pool for SSH connection reuse
+			fwd.MaxConns,
+		)
+		// Sibling guard: same as rll (see above).
+		inf.AllowLeakRecovery = s.leakRecoveryAllowed(fwd)
 		wrapper = ForwardWrapper{
-			Forward: forwarding.NewRemoteListenToRemote(
-				fwd.ListenAddr, // Full listen address (e.g., "127.0.0.1:11434")
-				fwd.ListenHost, // SSH hostname (e.g., "vmr.u24")
-				listenPort,     // Port number
-				listenHops,
-				fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:11434")
-				fwd.ServiceHost, // SSH hostname (e.g., "dc4")
-				servicePort,     // Port number
-				serviceHops,
-				fwd.ID,
-				s.db,
-				s.pool, // Connection pool for SSH connection reuse
-				fwd.MaxConns,
-			),
+			Forward: inf,
 		}
 
 	default:
