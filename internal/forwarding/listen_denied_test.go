@@ -15,6 +15,16 @@ import (
 // errDeniedCause mirrors x/crypto/ssh tcpip.go:138 verbatim.
 var errDeniedCause = errors.New("ssh: tcpip-forward request denied by peer")
 
+// freePort returns an OS-assigned free TCP port so tests never race on
+// fixed port numbers.
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = l.Close() }()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
 // newProbeClient returns a pooled connection to a testdouble configured to
 // reject tcpip-forward and answer exec with the given output/rc. The server
 // is returned so tests can assert sessionOpens().
@@ -150,11 +160,12 @@ func TestCancelRemoteListener(t *testing.T) {
 	defer func() { _ = pool.Release(pooled, "cancel-test") }()
 
 	// Held forward: cancel retracts it and reports released.
-	ln, err := pooled.Client.Listen("tcp", "127.0.0.1:23456")
+	bind := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	ln, err := pooled.Client.Listen("tcp", bind)
 	require.NoError(t, err)
 	require.Len(t, server.heldForwards(), 1)
 
-	released, err := cancelRemoteListener(pooled.Client, "127.0.0.1:23456")
+	released, err := cancelRemoteListener(pooled.Client, bind)
 	require.NoError(t, err)
 	assert.True(t, released, "held forward must be released")
 	assert.Empty(t, server.heldForwards())
@@ -165,7 +176,7 @@ func TestCancelRemoteListener(t *testing.T) {
 
 	// Not-held bind answers false without error; request still counted.
 	before := server.cancelRequests()
-	released, err = cancelRemoteListener(pooled.Client, "127.0.0.1:23999")
+	released, err = cancelRemoteListener(pooled.Client, fmt.Sprintf("127.0.0.1:%d", freePort(t)))
 	require.NoError(t, err)
 	assert.False(t, released, "unknown bind must answer false, not error")
 	assert.Equal(t, before+1, server.cancelRequests())

@@ -2,6 +2,7 @@ package forwarding
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -388,11 +389,14 @@ func TestRemoteListenToRemote_LeakHeal(t *testing.T) {
 	require.NoError(t, err)
 	// Seed the leak on the source side without ever cancelling (lost
 	// cancel-tcpip-forward). The client-side entry stays until
-	// leaked.Close() below (R2 P0-2 sequencing).
-	leaked, err := pooled.Client.Listen("tcp", "127.0.0.1:23458")
+	// leaked.Close() below (R2 P0-2 sequencing). Seed and source bind
+	// share one free port — the testdouble denies only explicit binds.
+	port := freePort(t)
+	source := fmt.Sprintf("127.0.0.1:%d", port)
+	leaked, err := pooled.Client.Listen("tcp", source)
 	require.NoError(t, err)
 
-	inf := NewRemoteListenToRemote("127.0.0.1:23458", "testdouble", 23458, hops,
+	inf := NewRemoteListenToRemote(source, "testdouble", port, hops,
 		"127.0.0.1:9999", "testdouble", 9999, hops,
 		"leak-heal-rlr", db.NewTestDB(t), pool, 0)
 	inf.AllowLeakRecovery = true

@@ -197,11 +197,13 @@ func TestRemoteListenToLocal_LeakHeal(t *testing.T) {
 	require.NoError(t, err)
 	// Seed the leak: bind the explicit port without ever cancelling
 	// (lost cancel-tcpip-forward). The entry stays client-side until
-	// we Close it below (R2 P0-2 sequencing).
-	leaked, err := pooled.Client.Listen("tcp", "127.0.0.1:23456")
+	// we Close it below (R2 P0-2 sequencing). Seed and forward bind
+	// share one free port — the testdouble denies only explicit binds.
+	bind := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	leaked, err := pooled.Client.Listen("tcp", bind)
 	require.NoError(t, err)
 
-	rf := NewRemoteListenToLocal("127.0.0.1:23456", "127.0.0.1:22",
+	rf := NewRemoteListenToLocal(bind, "127.0.0.1:22",
 		"leak-heal-test", testDB, pool, hops)
 	rf.AllowLeakRecovery = true
 	require.NoError(t, rf.Start(t.Context()))
@@ -233,11 +235,12 @@ func TestRemoteListenToLocal_LeakRecoveryOffByDefault(t *testing.T) {
 	}
 	pooled, err := pool.Acquire(t.Context(), sig, "off-seed")
 	require.NoError(t, err)
-	leaked, err := pooled.Client.Listen("tcp", "127.0.0.1:23457")
+	bind := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	leaked, err := pooled.Client.Listen("tcp", bind)
 	require.NoError(t, err)
 	before := server.cancelRequests()
 
-	rf := NewRemoteListenToLocal("127.0.0.1:23457", "127.0.0.1:22",
+	rf := NewRemoteListenToLocal(bind, "127.0.0.1:22",
 		"leak-off-test", db.NewTestDB(t), pool, hops)
 	// 不置 AllowLeakRecovery：deny 自然发生（占用仿真），行为须与批次 1 一致
 	err = rf.Start(t.Context())
