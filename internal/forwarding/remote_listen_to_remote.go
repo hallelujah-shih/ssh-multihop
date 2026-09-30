@@ -2,6 +2,7 @@ package forwarding
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -72,6 +73,9 @@ type RemoteListenToRemote struct {
 	healthCheckInterval time.Duration
 	healthCheckTicker   *time.Ticker
 	healthCheckDone     chan struct{}
+
+	// E2E liveness probe cadence (set at construction, read-only afterwards)
+	e2eInterval time.Duration
 }
 
 // NewRemoteListenToRemote creates a new inline forward
@@ -109,6 +113,7 @@ func NewRemoteListenToRemote(sourceAddr, sourceHost string, sourcePort int, sour
 		connMap:             make(map[net.Conn]struct{}),
 		healthCheckInterval: RandomHealthCheckInterval(),
 		healthCheckDone:     make(chan struct{}),
+		e2eInterval:         RandomE2EProbeInterval(),
 	}
 }
 
@@ -330,6 +335,9 @@ func (inf *RemoteListenToRemote) Start(ctx context.Context) error {
 
 	// Start health monitoring
 	inf.startHealthMonitoring(innerCtx)
+
+	// Start E2E liveness monitoring
+	inf.startE2EMonitoring(innerCtx)
 
 	// Start accept loop
 	inf.wg.Add(1) // Add acceptLoop to WaitGroup
@@ -684,6 +692,73 @@ func (inf *RemoteListenToRemote) startHealthMonitoring(ctx context.Context) {
 	zap.L().Debug("Health monitoring started",
 		zap.String("forward", inf.String()),
 		zap.String("interval", inf.healthCheckInterval.String()))
+}
+
+// E2ECheck probes the full data path by exec-ing the /dev/tcp probe on the
+// source-side pooled connection against this forward's own source listener.
+func (inf *RemoteListenToRemote) E2ECheck() error {
+	if inf.Status() != StatusRunning {
+		return fmt.Errorf("forward not running (status: %s)", inf.Status())
+	}
+	if inf.listener == nil {
+		return fmt.Errorf("%w: listener is nil", errE2EUnknown)
+	}
+	if inf.sourcePooledConn == nil || inf.sourcePooledConn.Client == nil {
+		return fmt.Errorf("%w: no source connection", errE2EUnknown)
+	}
+	return probeThroughTunnel(inf.sourcePooledConn.Client, inf.listener.Addr().String(), e2eProbeTimeout)
+}
+
+// startE2EMonitoring probes the full forwarding path on inf.e2eInterval. A
+// definitive path-death follows the health-failure path verbatim (warn, error
+// status, cancel); an inconclusive verdict only warns.
+func (inf *RemoteListenToRemote) startE2EMonitoring(ctx context.Context) {
+	inf.wg.Add(1)
+
+	go func() {
+		defer inf.wg.Done()
+		defer zap.L().Info("E2E monitoring stopped",
+			zap.String("forward", inf.String()))
+
+		ticker := time.NewTicker(inf.e2eInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-inf.healthCheckDone:
+				return
+			case <-ticker.C:
+				if err := inf.E2ECheck(); err != nil {
+					if errors.Is(err, errE2EUnknown) {
+						zap.L().Warn("E2E probe inconclusive",
+							zap.String("forward", inf.String()),
+							zap.Error(err))
+						continue
+					}
+
+					zap.L().Warn("E2E probe failed, setting error status",
+						zap.String("forward", inf.String()),
+						zap.Error(err))
+
+					// Set database status to error
+					inf.setErrorStatus(err.Error())
+
+					// Trigger unified cleanup by canceling context
+					// cleanupMonitor will handle all resource cleanup including closing listener
+					if inf.cancelFunc != nil {
+						inf.cancelFunc()
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	zap.L().Debug("E2E monitoring started",
+		zap.String("forward", inf.String()),
+		zap.String("interval", inf.e2eInterval.String()))
 }
 
 // Removed: attemptRepair, reconnect, monitorListenerHealth, and calculateBackoff methods
