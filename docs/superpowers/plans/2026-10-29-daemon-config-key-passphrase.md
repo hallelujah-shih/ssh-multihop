@@ -594,7 +594,7 @@ func TestLoadSpecs_DuplicatePathLoadsOnce(t *testing.T) {
 	t.Setenv("DUP_PASS", "pw")
 
 	kl := NewKeyLoader(mustUserCtx(t))
-	keys, err := kl.LoadSpecs([]daemoncfg.KeySpec{{Path: keyPath}, {Path: keyPath}})
+	keys, err := kl.LoadSpecs([]daemoncfg.KeySpec{{Path: keyPath, PassphraseEnv: "DUP_PASS"}, {Path: keyPath, PassphraseEnv: "DUP_PASS"}})
 	require.NoError(t, err)
 	assert.Len(t, keys, 1)
 }
