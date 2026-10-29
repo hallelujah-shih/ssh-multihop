@@ -22,6 +22,34 @@
 - 零注释默认；注释只写代码表达不了的"为什么"。
 - 每任务结束 `go build ./... && go vet ./...` 必须绿。
 
+### 业务契约与验证登记
+
+**Business Contract**: `docs/superpowers/specs/2026-10-29-daemon-config-key-passphrase-bcd.md`
+
+**验证入口与 tier 阶梯**（本机开发机即构建机）:
+- T1: `go build ./... && go vet ./...`
+- T2: `go test ./...`
+- T3: `make check`（fmt + vet + lint + test, fail fast）
+- T4（合并门槛）: T3 + `go test ./internal/api -tags=integration -v -timeout 30s`
+
+**当轮产物目录**（worktree 外）: `/home/shih/Downloads/tmp/opencode/sdd-config-keys/`（`ledger.md`、`dispatches/`、`runs/`）。目标仓无已登记 flake 签名/故障手册 -> 本批仅通用陷阱库；本批无脚本/配置类非代码资产（文档为 Markdown，无语法检查项）。
+
+**BCD mapping**（五元组按任务）:
+- Task 1 daemoncfg: Premortem -> BCD §6 P1(缺 config 空配置 WARN)/P3(env 权限 WARN)；Invariants -> §7 I3(不覆盖)/S1(路径日志)；BDD -> §4 env 文件 4 场景 + config 4 场景；Implicit Policies -> §3 env 语义(注释/引号/非法行)；SbE -> spec §2/§3 示例即解析验收目标。
+- Task 2 LoadSpecs: Premortem -> §6 P5(fail fast 取舍)；Invariants -> §7 I1/I4(变量名进日志、值不进)；BDD -> §4 口令正确/错误/变量缺失/无口令不读变量；Implicit Policies -> 懒读变量；SbE -> spec §2 keys 示例。
+- Task 3 Initialize/LoadOptions: Invariants -> §7 I1(装配可见)/I2(auto 零变化)；BDD -> §4 explicit 失败/auto 现状两条；Policies -> 无规格回落现状收集。
+- Task 4 daemon 装配: Premortem -> §6 P1(启动日志可见)/P4(breaking flag 移除)；Invariants -> §7 I1(SSH_AUTH_SOCK 不豁免)/I2/S1；BDD -> §4 装配相关 4 场景；Policies -> explicit 退出非 0 / auto Warn+continue。
+- Task 5 路径传播: Invariants -> §7 S2(ssh_dir 单点)；Policies -> 空值回落 RUID 现状；SbE -> spec §2 ssh_dir。
+- Task 6 builder 死代码: spec G4 删除清单；不触碰任何不变量（零调用死代码删除，回归测试兜底）。
+- Task 7 删除+文档: Premortem -> §6 P4(文档标注 breaking)；spec G4 收尾、§8 迁移说明。
+
+**不修清单**（清单外改动 = Phase 4 P1）:
+1. `internal/connection/builder.go:143-182` 默认 key 探测块——不接 ssh_dir（explicit 模式装配期 agent 已持 key 不可达；auto 模式零变化）。登记: spec §6 模块表 builder 行。
+2. `internal/config/parser.go:97-105` processInclude 的 `~` 展开——保持 RUID 语义（spec §2: 跨用户场景文档要求绝对路径）。登记: spec §2 规则条。
+3. `internal/agent/user_context.go:69-74` GetSSHConfigPath/GetSSHDir——保留为 auto 模式默认，`LoadOptions.SSHConfigPath` 为唯一覆盖入口。登记: spec §6 agent 行。
+4. `internal/api/testutil.go:29` NewWithContext——签名不变，不改。登记: 本 plan Task 5。
+5. `internal/util/userhome.go` RUID 语义——现状契约，不动。登记: spec §1 背景。
+
 ## Review Focus
 
 spec 未覆盖但最可能咬人的五类输入（每行已绑定到所属任务的测试步骤）:
