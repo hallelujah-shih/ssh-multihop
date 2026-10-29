@@ -577,6 +577,26 @@ keys:                                # 可选，配置即严格模式：任一 k
 
 `--env-file <path>` 提供环境变量（每行 `KEY=VALUE`，`#`/`;` 开头为注释，成对引号剥离，不覆盖已有变量），是加密 key 口令的注入来源。
 
+**迁移（breaking）：** `--passphrase-socket` 已移除（原按需口令机制从未接线，随本版删除）；启动命令或 unit 中传该 flag 会报未知 flag，删去即可，口令改经 `--env-file` 注入。
+
+**systemd unit 示例：**
+
+```ini
+[Unit]
+Description=ssh-multihop daemon
+After=network-online.target
+
+[Service]
+User=shih
+ExecStart=/opt/forward/ssh-multihop daemon --config /home/shih/.ssh-multihop/config.yaml --env-file /home/shih/.ssh-multihop/env --db /opt/forward/mydb.db --port 28080
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+权限事实：/opt/forward 对 shih 只读可执行，db 已由 shih 属主，config/env/keys 均在 /home/shih 下，unit 无需特权目录写权限。
+
 ## 性能优化总结
 
 | 优化项 | 之前 | 之后 | 提升 |
