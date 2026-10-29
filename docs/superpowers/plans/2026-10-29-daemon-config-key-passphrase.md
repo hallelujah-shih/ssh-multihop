@@ -1121,36 +1121,55 @@ git commit -m "feat(daemon): config/env-file driven key setup, remove passphrase
 - Modify: `internal/forwarding/ssh_helper.go:22-28`（加 configPath 参数）
 - Modify: `internal/service/forward_service.go`（`sshConfigPath` 字段 + `SetSSHConfigPath`；:88/:119 hopResolver 闭包；`buildHopsFromSignature` :1106-1110 改用字段）
 - Modify: `cmd/ssh-multihop/daemon.go`（svc 创建后注入: `if sshConfigPath != "" { svc.SetSSHConfigPath(sshConfigPath) }`）
-- Test: `internal/forwarding/ssh_helper_test.go`（既有用例同步加 configPath 参数 + 追加参数化用例; 簿记项由编译兜底）
+- Test: `internal/forwarding/ssh_helper_test.go`（追加判别用例）
+- Test: `internal/service/forward_service_test.go`（追加 S2 传播用例; t5-review 折入）
 
 **Interfaces:**
 - Consumes: Task 4 的 `svc.SetSSHConfigPath(path string)`。
 - Produces: `func BuildHopChainFromSSHConfig(targetHost, configPath string) ([]*tunnel.HopConfig, error)` —— `configPath` 为空时回落 RUID `~/.ssh/config`（现状语义, 保证 auto 零变化）。
 
-- [ ] **Step 1: 写失败测试（追加）**
+- [ ] **Step 1: 写失败测试（追加; t5-review 强化版——原两哨兵用例变异实证零判别力, 折入）**
 
 ```go
-func TestBuildHopChainFromSSHConfig_EmptyPathFallsBackToDefault(t *testing.T) {
-	// 现状语义回归: 空 configPath 不改变行为（可能因本机无对应 host 报错, 只断言不 panic 且错误信息含 config 路径解析上下文）
-	_, err := BuildHopChainFromSSHConfig("definitely-not-a-host-xyz", "")
-	_ = err // 行为与改造前一致即可: 不 panic
-}
-
 func TestBuildHopChainFromSSHConfig_ExplicitPathUsed(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config")
 	content := "Host myjumphost\n  HostName 127.0.0.1\n  User test\n"
 	require.NoError(t, os.WriteFile(cfgPath, []byte(content), 0o600))
 
-	_, err := BuildHopChainFromSSHConfig("myjumphost", cfgPath)
-	// 该 host 存在但无 ProxyJump -> hop 链为空或解析成功; 关键断言: 错误（若有）不是"config 不存在"
-	if err != nil {
-		assert.NotContains(t, err.Error(), "failed to parse SSH config")
-	}
+	chain, err := BuildHopChainFromSSHConfig("myjumphost", cfgPath)
+	require.NoError(t, err)
+	// 内容断言是判别位: 忽略 configPath 恒用默认时, myjumphost 未命中,
+	// HostName 回落为 host 名本身而非 127.0.0.1 -> 红
+	require.NotEmpty(t, chain)
+	assert.Equal(t, "127.0.0.1", chain[0].HostName)
+	assert.Equal(t, "test", chain[0].User)
 }
 ```
 
-（以仓库现有 ssh_helper_test.go 的实际风格为准调整; 断言核心是"显式路径被采用、空路径回落现状"。）
+（空路径回落现状不设独立用例：RUID 语义进程内不可差分，`_ = err` 哨兵零判别力——删除；空值回落行为由实现逐字对照 master 兜底。）
+
+```go
+// service 级: S2 传播判别（杀「字段被忽略恒用默认」全部变异）
+func TestSetSSHConfigPath_PropagatesToHopResolution(t *testing.T) {
+	testDB := db.NewTestDB(t)
+	svc, err := NewWithContext(context.Background(), testDB)
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config")
+	content := "Host svcalias\n  HostName 127.0.0.1\n  User svcuser\n"
+	require.NoError(t, os.WriteFile(cfgPath, []byte(content), 0o600))
+	svc.SetSSHConfigPath(cfgPath)
+
+	hops, err := svc.buildHopsFromSignature(connection.ConnectionSignature{Hostname: "svcalias"})
+	require.NoError(t, err)
+	require.NotEmpty(t, hops)
+	assert.Equal(t, "127.0.0.1", hops[0].Hostname)
+}
+```
+
+（若 buildHopsFromSignature 需要的签名字段不止 Hostname，按实际签名补零值字段；断言核心是反查走注入路径。若该函数间接依赖不可满足，等价改为经 getHopsForHost/hopResolver 闭包断言同一 HostName。）
 
 - [ ] **Step 2: 运行确认失败**
 
