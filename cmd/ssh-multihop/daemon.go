@@ -186,7 +186,7 @@ func runDaemon(c *cli.Context) error {
 		}
 
 		// Initialize built-in SSH agent early, before any SSH connections
-		if _, err := agent.GetBuiltInAgent(); err != nil {
+		if _, err := agent.GetBuiltInAgent(agent.LoadOptions{}); err != nil {
 			zap.L().Warn("Failed to initialize built-in SSH agent",
 				zap.Error(err))
 			// Continue anyway - might be able to use external agent or keys
@@ -298,7 +298,7 @@ func runDaemon(c *cli.Context) error {
 		}
 
 		// Step 4: Clean up built-in SSH agent
-		if agent, agentErr := agent.GetBuiltInAgent(); agentErr == nil {
+		if agent, agentErr := agent.GetBuiltInAgent(agent.LoadOptions{}); agentErr == nil {
 			if stopErr := agent.Stop(); stopErr != nil {
 				zap.L().Warn("Failed to stop built-in SSH agent",
 					zap.Error(stopErr))
@@ -322,7 +322,7 @@ func runDaemon(c *cli.Context) error {
 				zap.L().Warn("Service stop completed with errors", zap.Error(err))
 			}
 
-			if agent, agentErr := agent.GetBuiltInAgent(); agentErr == nil {
+			if agent, agentErr := agent.GetBuiltInAgent(agent.LoadOptions{}); agentErr == nil {
 				_ = agent.Stop()
 			}
 			return err

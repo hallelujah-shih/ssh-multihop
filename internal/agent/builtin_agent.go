@@ -28,17 +28,18 @@ var globalBuiltInAgent *BuiltInAgent
 var globalBuiltInAgentOnce sync.Once
 
 // GetBuiltInAgent returns the singleton built-in agent instance,
-// initializing it on first use.
-func GetBuiltInAgent() (*BuiltInAgent, error) {
+// initializing it on first use. On failure the error is cached by sync.Once:
+// there is no silent second initialization; later calls ignore opts.
+func GetBuiltInAgent(opts LoadOptions) (*BuiltInAgent, error) {
 	var initErr error
 	globalBuiltInAgentOnce.Do(func() {
-		globalBuiltInAgent, initErr = newBuiltInAgent()
+		globalBuiltInAgent, initErr = newBuiltInAgent(opts)
 	})
 	return globalBuiltInAgent, initErr
 }
 
 // newBuiltInAgent creates and initializes a built-in agent.
-func newBuiltInAgent() (*BuiltInAgent, error) {
+func newBuiltInAgent(opts LoadOptions) (*BuiltInAgent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	a := &BuiltInAgent{
@@ -46,7 +47,7 @@ func newBuiltInAgent() (*BuiltInAgent, error) {
 		cancel: cancel,
 	}
 
-	if err := a.init(); err != nil {
+	if err := a.init(opts); err != nil {
 		return nil, err
 	}
 
@@ -54,7 +55,7 @@ func newBuiltInAgent() (*BuiltInAgent, error) {
 }
 
 // init initializes the built-in agent.
-func (a *BuiltInAgent) init() error {
+func (a *BuiltInAgent) init(opts LoadOptions) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -65,7 +66,7 @@ func (a *BuiltInAgent) init() error {
 	}
 
 	// Initialize: load keys and start socket server
-	if err := goAgent.Initialize(); err != nil {
+	if err := goAgent.Initialize(opts); err != nil {
 		return fmt.Errorf("failed to initialize Go agent: %w", err)
 	}
 

@@ -232,7 +232,7 @@ func (b *SSHClientConfigBuilder) trySSHAgent() (ssh.AuthMethod, error) {
 
 	// Fallback to built-in agent (pure in-memory agent)
 	// Only used if no external SSH agent is available
-	if builtInAgent, err := agentpkg.GetBuiltInAgent(); err == nil && builtInAgent.IsAvailable() {
+	if builtInAgent, err := agentpkg.GetBuiltInAgent(agentpkg.LoadOptions{}); err == nil && builtInAgent.IsAvailable() {
 		zap.L().Info("Using built-in in-memory SSH agent (fallback, no SSH_AUTH_SOCK)",
 			zap.Int("keys", builtInAgent.GetKeyCount()))
 
