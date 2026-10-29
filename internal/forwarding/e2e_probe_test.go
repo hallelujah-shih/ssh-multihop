@@ -115,15 +115,14 @@ func TestProbeThroughTunnel_TimeoutYieldsUnknown(t *testing.T) {
 	require.ErrorIs(t, err, errE2EUnknown)
 }
 
-func TestProbeThroughTunnel_SlowCannedOutputYieldsUnknown(t *testing.T) {
+func TestProbeThroughTunnel_SlowCannedOutputYieldsAlive(t *testing.T) {
 	server := newTestSSHServer(t)
 	server.setSessionOutput("E2E_SLOW", 0)
 	pool, hops := newTestConnectionManager(t, server)
 	pooled := acquireTestClient(t, pool, hops)
 
 	err := probeThroughTunnel(pooled.Client, "127.0.0.1:8888", 500*time.Millisecond)
-	require.ErrorIs(t, err, errE2EUnknown, "E2E_SLOW must classify as unknown, never as death")
-	assert.NotContains(t, err.Error(), "e2e probe failed")
+	require.NoError(t, err, "E2E_SLOW must classify as alive (connect proved the chain), never as death")
 }
 
 func TestProbeTargetThroughClient_RelayOpen(t *testing.T) {
@@ -185,8 +184,8 @@ func TestE2EProbeRealPath(t *testing.T) {
 			assert.Contains(t, err.Error(), "e2e probe failed")
 			assert.NotErrorIs(t, err, errE2EUnknown)
 		}},
-		{"silent target unknown", silentL.Addr().String(), func(t *testing.T, err error) {
-			require.ErrorIs(t, err, errE2EUnknown)
+		{"silent target alive", silentL.Addr().String(), func(t *testing.T, err error) {
+			require.NoError(t, err)
 		}},
 	}
 
@@ -196,7 +195,7 @@ func TestE2EProbeRealPath(t *testing.T) {
 			require.NoError(t, fwd.Start(t.Context()))
 			defer func() { _ = fwd.Stop() }()
 
-			err := probeThroughTunnel(fwd.pooledConn.Client, fwd.listener.Addr().String(), 250*time.Millisecond)
+			err := probeThroughTunnel(fwd.pooledConn.Client, fwd.listener.Addr().String(), 4*time.Second)
 			tc.want(t, err)
 		})
 	}

@@ -13,11 +13,14 @@ import (
 )
 
 // e2eProbeTimeout bounds one E2E liveness probe. Package var so tests can
-// shrink it.
+// shrink it. Must stay above the remote `read -t 2` (2s) plus session
+// overhead, or silent targets regress to unknown (WARN noise) instead of
+// alive.
 var e2eProbeTimeout = 5 * time.Second
 
-// errE2EUnknown marks an inconclusive probe (slow target, exec failure,
-// timeout, unreadable output): the monitor only warns and leaves state alone.
+// errE2EUnknown marks an inconclusive probe (exec failure, timeout,
+// unreadable output): the monitor only warns and leaves state alone.
+// E2E_SLOW is not unknown: a successful connect already proved the chain.
 var errE2EUnknown = errors.New("e2e probe inconclusive")
 
 // e2eProbeCmdTmpl reads one byte from the probed address through bash's
@@ -94,7 +97,10 @@ func probeThroughTunnel(client *ssh.Client, listenAddr string, timeout time.Dura
 		case strings.Contains(out, "E2E_FAIL"):
 			return fmt.Errorf("e2e probe failed: %s", out)
 		case strings.Contains(out, "E2E_SLOW"):
-			return fmt.Errorf("%w: %s", errE2EUnknown, out)
+			// Connect succeeded but no unsolicited byte within 2s: silent
+			// protocol (HTTP, mongo) waiting for the client to speak first.
+			// The connect already proved the full chain - classify alive.
+			return nil
 		default:
 			return fmt.Errorf("%w: unexpected probe output %q", errE2EUnknown, out)
 		}
