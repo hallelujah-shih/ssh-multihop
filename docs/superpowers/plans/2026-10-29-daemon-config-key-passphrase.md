@@ -887,7 +887,7 @@ git commit -m "feat(agent): Initialize accepts LoadOptions for explicit key mode
 
 **Interfaces:**
 - Consumes: Task 1 `daemoncfg.Load/LoadDefault/LoadEnvFile/ExplicitKeys/ResolvedSSHConfigPath/ResolvedKeyPaths`；Task 3 `agent.LoadOptions/GetBuiltInAgent`。
-- Produces: 无新接口（装配层）。`runDaemon` 在 explicit 失败时返回 error -> urfave/cli 以非 0 退出。
+- Produces: 未导出装配函数 `func initKeysForRun(cfg *daemoncfg.Config, sshConfigPath string, initAgent func(agent.LoadOptions) error) error` —— 第三个参数注入初始化依赖（runDaemon 传真 `GetBuiltInAgent` 闭包; 测试传独立构造的 `GoAgent` 加载器, 避免进程级 sync.Once 单例使用例互斥）。`runDaemon` 在 explicit 失败时返回 error -> urfave/cli 以非 0 退出。
 
 - [ ] **Step 1: 写失败测试（flag 层 + 装配层）**
 
@@ -903,26 +903,46 @@ func TestDaemonCommand_Flags(t *testing.T) {
 }
 
 // startFakeAgent 起一个真实的进程内 ssh-agent（非 mock）, 返回 socket 路径。
+// 注意: x/crypto v0.48 已移除 agent.NewServer, 用 ServeAgent + Accept 循环;
+// socket 目录用 os.MkdirTemp 短路径（unix sun_path 108 字节上限, t.TempDir 长测试名会 bind 失败）。
 func startFakeAgent(t *testing.T) string {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
-	signer, err := ssh.NewSignerFromKey(priv)
-	require.NoError(t, err)
 	ag := agent.NewKeyring()
 	require.NoError(t, ag.Add(agent.AddedKey{PrivateKey: priv}))
-	l, err := net.Listen("unix", filepath.Join(t.TempDir(), "agent.sock"))
+	dir, err := os.MkdirTemp("", "sfa-")
 	require.NoError(t, err)
-	srv := agent.NewServer(ag)
-	go srv.Serve(l)
-	t.Cleanup(l.Close)
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	l, err := net.Listen("unix", filepath.Join(dir, "agent.sock"))
+	require.NoError(t, err)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go agent.ServeAgent(ag, c)
+		}
+	}()
+	t.Cleanup(func() { _ = l.Close() })
 	return l.Addr().String()
+}
+
+// freshGoAgentInit is the injected loader for tests: a real per-call
+// construction, no process-wide singleton, order-independent.
+func freshGoAgentInit(opts agent.LoadOptions) error {
+	ga, err := agent.NewGoAgent()
+	if err != nil {
+		return err
+	}
+	return ga.Initialize(opts)
 }
 
 func TestInitKeysForRun_ExplicitBadKeyFailsWithoutExternalAgent(t *testing.T) {
 	t.Setenv("SSH_AUTH_SOCK", "") // 无外部 agent
 	cfg := &daemoncfg.Config{Keys: []daemoncfg.KeySpec{{Path: "/nonexistent/k"}}}
-	err := initKeysForRun(cfg, "")
+	err := initKeysForRun(cfg, "", freshGoAgentInit)
 	require.Error(t, err, "explicit 模式任一 key 失败必须报错（runDaemon 返回 error -> 退出非 0）")
 	assert.Contains(t, err.Error(), "/nonexistent/k")
 }
@@ -931,7 +951,7 @@ func TestInitKeysForRun_ExplicitStillValidatesWithExternalAgent(t *testing.T) {
 	// spec I1 核心: SSH_AUTH_SOCK 可用不得豁免 explicit 校验
 	t.Setenv("SSH_AUTH_SOCK", startFakeAgent(t))
 	cfg := &daemoncfg.Config{Keys: []daemoncfg.KeySpec{{Path: "/nonexistent/k"}}}
-	err := initKeysForRun(cfg, "")
+	err := initKeysForRun(cfg, "", freshGoAgentInit)
 	require.Error(t, err, "外部 agent 存在时 explicit 坏 key 仍必须失败")
 }
 
@@ -945,17 +965,17 @@ func TestInitKeysForRun_ExplicitGoodKeySucceeds(t *testing.T) {
 	keyPath := filepath.Join(dir, "id_ok")
 	require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(block), 0o600))
 	cfg := &daemoncfg.Config{Keys: []daemoncfg.KeySpec{{Path: keyPath}}}
-	require.NoError(t, initKeysForRun(cfg, ""))
+	require.NoError(t, initKeysForRun(cfg, "", freshGoAgentInit))
 }
 
 func TestInitKeysForRun_AutoWithExternalAgentTakesAgentPath(t *testing.T) {
 	// auto 模式 + 外部 agent: 不初始化内置 agent, 返回 nil（现状短路语义）
 	t.Setenv("SSH_AUTH_SOCK", startFakeAgent(t))
-	require.NoError(t, initKeysForRun(&daemoncfg.Config{}, ""))
+	require.NoError(t, initKeysForRun(&daemoncfg.Config{}, "", freshGoAgentInit))
 }
 ```
 
-测试注意: `GetBuiltInAgent` 是 sync.Once 单例，跨测试共享——本组测试全部走「失败路径」或「外部 agent 短路路径」，唯一命中初始化的是 `ExplicitGoodKeySucceeds`（其断言 nil error 对缓存态同样成立），测试间无顺序依赖。
+测试注意（t4-impl 停工裁决折入）: 原 plan 假设四用例可共享 `GetBuiltInAgent` 单例且无顺序依赖——实测不成立: sync.Once 恰被首调花掉, 先坏则 GoodKey 收到缓存错误必败, 先好则 BadKey/StillValidates 必败, 数学上无全绿顺序。裁决: initKeysForRun 注入初始化依赖（见 Produces）, 各用例经 `freshGoAgentInit` 独立构造真实加载器——I1「外部 agent 不豁免」场景由此被真正行使（原方案下该场景从未真跑）。GetBuiltInAgent 自身的失败缓存语义由 agent 包 b0009c0 用例覆盖。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -1023,14 +1043,16 @@ zap.L().Info("Daemon configuration loaded",
 ```go
 // initKeysForRun initializes key material per config mode.
 // Explicit mode is fatal on any key failure; auto mode keeps today's lenient behavior.
-func initKeysForRun(cfg *daemoncfg.Config, sshConfigPath string) error {
+// initAgent is injected: runDaemon passes the real GetBuiltInAgent closure; tests
+// construct per-call loaders (process-wide sync.Once would make tests order-coupled).
+func initKeysForRun(cfg *daemoncfg.Config, sshConfigPath string, initAgent func(agent.LoadOptions) error) error {
 	externalSocket, keyCount, err := agent.CheckExternalAgent()
 	if err != nil {
 		zap.L().Warn("External SSH agent check failed", zap.Error(err))
 	}
 	if cfg.ExplicitKeys() {
 		// Strict mode: configured keys must load regardless of any external agent.
-		if _, err := agent.GetBuiltInAgent(agent.LoadOptions{Keys: cfg.Keys, SSHConfigPath: sshConfigPath}); err != nil {
+		if err := initAgent(agent.LoadOptions{Keys: cfg.Keys, SSHConfigPath: sshConfigPath}); err != nil {
 			return fmt.Errorf("failed to load configured SSH keys: %w", err)
 		}
 		if externalSocket != "" {
@@ -1049,14 +1071,23 @@ func initKeysForRun(cfg *daemoncfg.Config, sshConfigPath string) error {
 	if err := agent.CleanupOrphanedAgents(); err != nil {
 		zap.L().Warn("Failed to clean up orphaned SSH agents", zap.Error(err))
 	}
-	if _, err := agent.GetBuiltInAgent(agent.LoadOptions{SSHConfigPath: sshConfigPath}); err != nil {
+	if err := initAgent(agent.LoadOptions{SSHConfigPath: sshConfigPath}); err != nil {
 		zap.L().Warn("Failed to initialize built-in SSH agent", zap.Error(err))
 	}
 	return nil
 }
 ```
 
-runDaemon 中原 :167-194 块替换为 `if err := initKeysForRun(cfg, sshConfigPath); err != nil { return err }`。
+runDaemon 中原 :167-194 块替换为:
+
+```go
+if err := initKeysForRun(cfg, sshConfigPath, func(opts agent.LoadOptions) error {
+	_, err := agent.GetBuiltInAgent(opts)
+	return err
+}); err != nil {
+	return err
+}
+```
 
 svc 创建后（:233 之后、svc.Start 之前）注入（**放在本任务不做**——`SetSSHConfigPath` 由 Task 5 引入, 本任务只算出 `sshConfigPath` 并打日志, 避免引用尚不存在的方法）:
 
