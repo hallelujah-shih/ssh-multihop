@@ -83,7 +83,7 @@ keys:                            # 可选。缺省 = 现状自动收集
 | `cmd/ssh-multihop/daemon.go` | 加 `--config`/`--env-file`, 删 `--passphrase-socket`; 装配顺序: 读配置 -> 加载 env -> 按 keys 模式初始化 agent（explicit 失败退出, auto 保持 Warn+continue） |
 | `internal/agent/key_loader.go` | `tryLoadKey` 支持口令解密; 新增按 KeySpec 列表加载的入口（严格模式） |
 | `internal/agent/agent.go`、`internal/agent/builtin_agent.go` | `GoAgent.Initialize` / `GetBuiltInAgent` 链路接收 KeySpec 规格（共约 4 处签名）; 单例 `sync.Once` 语义注意: once 不重试, 失败错误被缓存返回, 不存在静默二次初始化; explicit 模式下 agent 初始化提前到装配期（而非首次连接时） |
-| `internal/connection/builder.go` | 删口令查询链; 默认 key 探测路径改由 ssh_dir 推导（单一解析点） |
+| `internal/connection/builder.go` | 删口令查询死代码链（`SetPassphraseSocket` 无调用方, `b.passphraseSocket` 恒为 nil）。默认 key 探测块保持现状: explicit 模式装配期内存 agent 已持有 key, 该块不可达; auto 模式行为零变化（BCD I2）, 不接 ssh_dir 管道 |
 | `internal/forwarding/ssh_helper.go`、`internal/service/forward_service.go`、`internal/agent/user_context.go` | ssh config 路径改由 ssh_dir 单点解析。传播机制: 启动装配期解析一次得到绝对路径, 以**显式参数/构造函数注入**传入三处（hop 链构造、service 的 sshConfigCache 键、agent 的 GetSSHConfigPath）, 不引入包级全局变量 |
 | `go.mod` | gopkg.in/yaml.v3 转 direct |
 | docs | architecture.md、AGENTS.md 更新; README 增配置示例 |
