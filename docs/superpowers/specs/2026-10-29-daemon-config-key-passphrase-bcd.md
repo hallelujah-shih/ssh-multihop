@@ -73,4 +73,4 @@
 
 软不变量（应满足, 允许权衡）:
 - S1 配置/env/key 解析过程在启动日志可见（路径、数量、失败原因）。
-- S2 ssh config 与默认 key 路径由 ssh_dir 单点决定。
+- S2 ssh config 与默认 key 路径由 ssh_dir 单点决定。（2026-10-29 实施校准: ssh_dir 不改变 auto 模式默认 key 收集, 见不修清单）

@@ -569,9 +569,9 @@ if socket != "" {
 daemon 启动时加载 YAML 配置：默认路径 `~/.ssh-multihop/config.yaml`，`--config <path>` 显式指定。默认路径缺失即为空配置（自动收集模式）；显式指定的配置文件缺失则启动失败。
 
 ```yaml
-ssh_dir: /home/shih/.ssh            # 可选，覆盖 ssh config 与私钥目录
+ssh_dir: /home/shih/.ssh            # 可选，覆盖 ssh config 路径；auto 模式默认 key 收集仍走 ~/.ssh
 keys:                                # 可选，配置即严格模式：任一 key 加载失败 daemon 拒绝启动
-  - path: /home/shih/.ssh/dc
+  - path: /home/shih/.ssh/dc         # 显式 keys 时 key 路径按条目展开（~ 为运行用户 HOME）
     passphrase_env: DC_KEY_PASSPHRASE   # 可选，仅在 key 需要解密时读取该变量
 ```
 

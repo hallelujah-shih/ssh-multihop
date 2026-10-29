@@ -27,7 +27,7 @@ reboot 后 daemon 以服务方式拉起时，`util.UserHomeDir()` 按 RUID 解�
 
 ```yaml
 # ~/.ssh-multihop/config.yaml
-ssh_dir: /home/shih/.ssh        # 可选。缺省 = util.UserHomeDir() 下的 ~/.ssh（现状语义）
+ssh_dir: /home/shih/.ssh        # 可选。缺省 = util.UserHomeDir() 下的 ~/.ssh（现状语义）（2026-10-29 实施校准: ssh_dir 不改变 auto 模式默认 key 收集, 见不修清单）
 keys:                            # 可选。缺省 = 现状自动收集
   - path: /home/shih/.ssh/dc     # 私钥路径；<path>-cert.pub 证书按现有命名约定自动带出
     passphrase_env: DC_KEY_PASSPHRASE   # 可选。解密口令的 env 变量名
@@ -84,7 +84,7 @@ keys:                            # 可选。缺省 = 现状自动收集
 | `internal/agent/key_loader.go` | `tryLoadKey` 支持口令解密; 新增按 KeySpec 列表加载的入口（严格模式） |
 | `internal/agent/agent.go`、`internal/agent/builtin_agent.go` | `GoAgent.Initialize` / `GetBuiltInAgent` 链路接收 KeySpec 规格（共约 4 处签名）; 单例 `sync.Once` 语义注意: once 不重试, 失败错误被缓存返回, 不存在静默二次初始化; explicit 模式下 agent 初始化提前到装配期（而非首次连接时） |
 | `internal/connection/builder.go` | 删口令查询死代码链（`SetPassphraseSocket` 无调用方, `b.passphraseSocket` 恒为 nil）。默认 key 探测块保持现状: explicit 模式装配期内存 agent 已持有 key, 该块不可达; auto 模式行为零变化（BCD I2）, 不接 ssh_dir 管道 |
-| `internal/forwarding/ssh_helper.go`、`internal/service/forward_service.go`、`internal/agent/user_context.go` | ssh config 路径改由 ssh_dir 单点解析。传播机制: 启动装配期解析一次得到绝对路径, 以**显式参数/构造函数注入**传入三处（hop 链构造、service 的 sshConfigCache 键、agent 的 GetSSHConfigPath）, 不引入包级全局变量 |
+| `internal/forwarding/ssh_helper.go`、`internal/service/forward_service.go`、`internal/agent/user_context.go` | ssh config 路径改由 ssh_dir 单点解析。传播机制: 启动装配期解析一次得到绝对路径, 以**显式参数/构造函数注入**传入三处（hop 链构造、service 的 sshConfigCache 键、agent 的 GetSSHConfigPath）, 不引入包级全局变量（2026-10-29 实施校准: ssh_dir 不改变 auto 模式默认 key 收集, 见不修清单） |
 | `go.mod` | gopkg.in/yaml.v3 转 direct |
 | docs | architecture.md、AGENTS.md 更新; README 增配置示例 |
 

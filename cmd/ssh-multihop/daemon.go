@@ -147,7 +147,8 @@ func runDaemon(c *cli.Context) error {
 		configFlag, _ = daemoncfg.DefaultPath() // S1: 默认路径也实打日志（可能为空串, 仅日志用途）
 	}
 	envLoaded := 0
-	if envFile := c.String("env-file"); envFile != "" {
+	envFile := c.String("env-file")
+	if envFile != "" {
 		var envErr error
 		envLoaded, envErr = daemoncfg.LoadEnvFile(envFile)
 		if envErr != nil {
@@ -165,6 +166,7 @@ func runDaemon(c *cli.Context) error {
 		zap.String("config", configFlag),
 		zap.Bool("explicit_keys", cfg.ExplicitKeys()),
 		zap.Int("keys", len(cfg.Keys)),
+		zap.String("env_file", envFile),
 		zap.Int("env_vars_loaded", envLoaded),
 		zap.String("ssh_config", sshConfigPath))
 
