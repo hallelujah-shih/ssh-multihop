@@ -37,11 +37,11 @@
 **BCD mapping**（五元组按任务）:
 - Task 1 daemoncfg: Premortem -> BCD §6 P1(缺 config 空配置 WARN)/P3(env 权限 WARN)；Invariants -> §7 I3(不覆盖)/S1(路径日志)；BDD -> §4 env 文件 4 场景 + config 4 场景；Implicit Policies -> §3 env 语义(注释/引号/非法行)；SbE -> spec §2/§3 示例即解析验收目标。
 - Task 2 LoadSpecs: Premortem -> §6 P5(fail fast 取舍)；Invariants -> §7 I1/I4(变量名进日志、值不进)；BDD -> §4 口令正确/错误/变量缺失/无口令不读变量；Implicit Policies -> 懒读变量；SbE -> spec §2 keys 示例。
-- Task 3 Initialize/LoadOptions: Invariants -> §7 I1(装配可见)/I2(auto 零变化)；BDD -> §4 explicit 失败/auto 现状两条；Policies -> 无规格回落现状收集。
-- Task 4 daemon 装配: Premortem -> §6 P1(启动日志可见)/P4(breaking flag 移除)；Invariants -> §7 I1(SSH_AUTH_SOCK 不豁免)/I2/S1；BDD -> §4 装配相关 4 场景；Policies -> explicit 退出非 0 / auto Warn+continue。
-- Task 5 路径传播: Invariants -> §7 S2(ssh_dir 单点)；Policies -> 空值回落 RUID 现状；SbE -> spec §2 ssh_dir。
+- Task 3 Initialize/LoadOptions: Premortem -> 不适用（装配内部签名改造, §6 无对应失败原因）；Invariants -> §7 I1(装配可见)/I2(auto 零变化)；BDD -> §4 explicit 失败/auto 现状两条；Implicit Policies -> 无规格回落现状收集（且解析失败不加默认回落, r1 P1-2）；SbE -> spec §2 keys 列表示例的加载语义。
+- Task 4 daemon 装配: Premortem -> §6 P1(启动日志可见)/P4(breaking flag 移除)；Invariants -> §7 I1(SSH_AUTH_SOCK 不豁免, 有装配级测试)/I2/S1(env_vars_loaded 入日志)；BDD -> §4 装配相关 4 场景（含外部 agent 两态）；Implicit Policies -> explicit 退出非 0 / auto Warn+continue；SbE -> spec §2/§3 示例 + §8 unit 模板接线。
+- Task 5 路径传播: Premortem -> 不适用（内部传播机制, §6 无对应失败原因）；Invariants -> §7 S2(ssh_dir 单点)；BDD -> 不适用（无新增可观察行为, 空值回落由回归测试兜底）；Implicit Policies -> 空值回落 RUID 现状；SbE -> spec §2 ssh_dir 覆盖语义。
 - Task 6 builder 死代码: spec G4 删除清单；不触碰任何不变量（零调用死代码删除，回归测试兜底）。
-- Task 7 删除+文档: Premortem -> §6 P4(文档标注 breaking)；spec G4 收尾、§8 迁移说明。
+- Task 7 删除+文档: Premortem -> §6 P4(文档标注 breaking)；Invariants -> 不适用（纯文档与死代码删除, 无行为面）；BDD -> 不适用（同前）；Implicit Policies -> 不适用（同前）；SbE -> spec §8 unit 模板落 docs + §2 配置示例落 README。
 
 **不修清单**（清单外改动 = Phase 4 P1）:
 1. `internal/connection/builder.go:143-182` 默认 key 探测块——不接 ssh_dir（explicit 模式装配期 agent 已持 key 不可达；auto 模式零变化）。登记: spec §6 模块表 builder 行。
@@ -81,7 +81,7 @@ spec 未覆盖但最可能咬人的五类输入（每行已绑定到所属任务
   - `func (c *Config) ExplicitKeys() bool` —— `len(c.Keys) > 0`
   - `func (c *Config) ResolvedSSHConfigPath() (string, error)` —— SSHDir 为空 -> `("", nil)`；否则 `~` 展开 + `/config`
   - `func (c *Config) ResolvedKeyPaths() error` —— 就地 `~` 展开每个 `Keys[i].Path`（`~user` 形式 -> error "not supported, use absolute path"）
-  - `func LoadEnvFile(path string) error`
+  - `func LoadEnvFile(path string) (int, error)` —— 返回加载的变量条数（供 S1 日志）
 
 - [ ] **Step 1: 写 config.go 的失败测试**
 
@@ -320,7 +320,9 @@ func TestLoadEnvFile_ParsesValuesAndStripsPairedQuotes(t *testing.T) {
 	content := "# comment\n; also comment\n\nPLAIN=hello\nQUOTED=\"hi there\"\nSINGLE='x y'\nHASH_IN_VALUE=a#b\nSEMI_IN_VALUE=c;d\n"
 	require.NoError(t, os.WriteFile(p, []byte(content), 0o600))
 
-	require.NoError(t, LoadEnvFile(p))
+	n, err := LoadEnvFile(p)
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
 	t.Cleanup(func() { os.Unsetenv("PLAIN"); os.Unsetenv("QUOTED"); os.Unsetenv("SINGLE"); os.Unsetenv("HASH_IN_VALUE"); os.Unsetenv("SEMI_IN_VALUE") })
 
 	for name, want := range map[string]string{
@@ -333,11 +335,23 @@ func TestLoadEnvFile_ParsesValuesAndStripsPairedQuotes(t *testing.T) {
 	}
 }
 
+func TestLoadEnvFile_ExportPrefixLineIsInvalidAndSkipped(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "env")
+	require.NoError(t, os.WriteFile(p, []byte("export FOO=bar\nGOOD=1\n"), 0o600))
+	n, err := LoadEnvFile(p)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	t.Cleanup(func() { os.Unsetenv("GOOD") })
+	_, ok := os.LookupEnv("export FOO")
+	assert.False(t, ok)
+}
+
 func TestLoadEnvFile_DoesNotOverrideExisting(t *testing.T) {
 	t.Setenv("EXISTING_VAR", "original")
 	p := filepath.Join(t.TempDir(), "env")
 	require.NoError(t, os.WriteFile(p, []byte("EXISTING_VAR=overwritten\n"), 0o600))
-	require.NoError(t, LoadEnvFile(p))
+	_, err := LoadEnvFile(p)
+	require.NoError(t, err)
 	got, _ := os.LookupEnv("EXISTING_VAR")
 	assert.Equal(t, "original", got)
 }
@@ -345,7 +359,9 @@ func TestLoadEnvFile_DoesNotOverrideExisting(t *testing.T) {
 func TestLoadEnvFile_SkipsInvalidLinesWithWarning(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "env")
 	require.NoError(t, os.WriteFile(p, []byte("NO_EQUALS_SIGN\nOK=1\n"), 0o600))
-	require.NoError(t, LoadEnvFile(p))
+	n, err := LoadEnvFile(p)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
 	t.Cleanup(func() { os.Unsetenv("OK") })
 	got, ok := os.LookupEnv("OK")
 	require.True(t, ok)
@@ -355,7 +371,8 @@ func TestLoadEnvFile_SkipsInvalidLinesWithWarning(t *testing.T) {
 func TestLoadEnvFile_WarnsOnLoosePermissions(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "env")
 	require.NoError(t, os.WriteFile(p, []byte("LOOSE=1\n"), 0o644))
-	require.NoError(t, LoadEnvFile(p))
+	_, err := LoadEnvFile(p)
+	require.NoError(t, err)
 	t.Cleanup(func() { os.Unsetenv("LOOSE") })
 }
 ```
@@ -379,10 +396,10 @@ import (
 	"go.uber.org/zap"
 )
 
-func LoadEnvFile(path string) error {
+func LoadEnvFile(path string) (int, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("failed to stat env file %s: %w", path, err)
+		return 0, fmt.Errorf("failed to stat env file %s: %w", path, err)
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
 		zap.L().Warn("Env file permissions are too open, expected 0600",
@@ -391,10 +408,11 @@ func LoadEnvFile(path string) error {
 
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("failed to open env file %s: %w", path, err)
+		return 0, fmt.Errorf("failed to open env file %s: %w", path, err)
 	}
 	defer f.Close()
 
+	loaded := 0
 	sc := bufio.NewScanner(f)
 	for lineNo := 1; sc.Scan(); lineNo++ {
 		line := strings.TrimSpace(sc.Text())
@@ -413,13 +431,15 @@ func LoadEnvFile(path string) error {
 			continue
 		}
 		if err := os.Setenv(key, value); err != nil {
-			return fmt.Errorf("failed to set %s from %s: %w", key, path, err)
+			return loaded, fmt.Errorf("failed to set %s from %s: %w", key, path, err)
 		}
+		loaded++
 	}
-	return sc.Err()
+	return loaded, sc.Err()
 }
 
 // cutEnvLine splits KEY=VALUE, stripping one pair of surrounding quotes from VALUE.
+// Key charset is [A-Za-z0-9_]; anything else (e.g. "export FOO", spaces) is invalid.
 // No export prefix, no backslash escaping (deliberately not systemd-compatible, see spec).
 func cutEnvLine(line string) (string, string, bool) {
 	key, value, found := strings.Cut(line, "=")
@@ -428,7 +448,7 @@ func cutEnvLine(line string) (string, string, bool) {
 	}
 	key = strings.TrimSpace(key)
 	value = strings.TrimSpace(value)
-	if key == "" {
+	if key == "" || !validEnvKey(key) {
 		return "", "", false
 	}
 	if len(value) >= 2 {
@@ -437,6 +457,15 @@ func cutEnvLine(line string) (string, string, bool) {
 		}
 	}
 	return key, value, true
+}
+
+func validEnvKey(key string) bool {
+	for _, r := range key {
+		if !(r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return len(key) > 0
 }
 ```
 
@@ -464,8 +493,9 @@ git commit -m "feat(daemoncfg): config and env-file loading for daemon key setup
 **Interfaces:**
 - Consumes: `daemoncfg.KeySpec`（Task 1: `Path string`, `PassphraseEnv string`）。
 - Produces:
-  - `func (kl *KeyLoader) LoadSpecs(specs []daemoncfg.KeySpec) ([]*agent.AddedKey, error)` —— 严格: 任一失败 -> error 聚合（含 key 路径 + 变量名）；全部成功 -> added keys
-  - `tryLoadKey` 内部签名变为 `tryLoadKey(keyPath, passphrase string) *loadedKey`，`loadedKey{added *agent.AddedKey; err error}`（auto 模式调用方继续忽略 err 跳过）
+  - `func (kl *KeyLoader) LoadSpecs(specs []daemoncfg.KeySpec) ([]*agent.AddedKey, error)` —— 严格: 任一失败 -> error 聚合（含 key 路径 + 变量名）；全部成功 -> added keys；同路径去重只加载一次
+  - `func withCert(keyPath string, privateKey crypto.PrivateKey) (*agent.AddedKey, error)` —— 从 `tryLoadKey` 现有 cert 逻辑（key_loader.go:105-120）提取共享；`LoadSpecs` 与 `tryLoadKey` 共用
+  - `tryLoadKey` 签名与行为不变（auto 模式专用, 零变化）
 
 - [ ] **Step 1: 写失败测试（覆盖 Review Focus 1/5/4）**
 
@@ -475,6 +505,7 @@ package agent
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"testing"
@@ -565,6 +596,36 @@ func TestLoadSpecs_DuplicatePathLoadsOnce(t *testing.T) {
 	keys, err := kl.LoadSpecs([]daemoncfg.KeySpec{{Path: keyPath}, {Path: keyPath}})
 	require.NoError(t, err)
 	assert.Len(t, keys, 1)
+}
+
+func TestLoadSpecs_CertAutoAttached(t *testing.T) {
+	dir := t.TempDir()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := ssh.NewSignerFromKey(priv)
+	require.NoError(t, err)
+	block, err := ssh.MarshalPrivateKey(priv, "withcert")
+	require.NoError(t, err)
+	keyPath := filepath.Join(dir, "id_wc")
+	require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(block), 0o600))
+
+	cert := &ssh.Certificate{
+		Key:             signer.PublicKey(),
+		Serial:          1,
+		CertType:        ssh.UserCert,
+		KeyId:           "test",
+		ValidPrincipals: []string{"test"},
+		ValidAfter:      0,
+		ValidBefore:     0xFFFFFFFFFFFFFFFF,
+	}
+	require.NoError(t, cert.SignCert(rand.Reader, signer))
+	require.NoError(t, os.WriteFile(keyPath+"-cert.pub", cert.Marshal(), 0o600))
+
+	kl := NewKeyLoader(mustUserCtx(t))
+	keys, err := kl.LoadSpecs([]daemoncfg.KeySpec{{Path: keyPath}})
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	assert.NotNil(t, keys[0].Certificate, "cert must be auto-attached")
 }
 
 func mustUserCtx(t *testing.T) *UserContext {
@@ -677,7 +738,8 @@ git commit -m "feat(agent): strict key loading from configured KeySpecs with env
 **Files:**
 - Modify: `internal/agent/agent.go:41-83`（Initialize 签名与分支）、`internal/agent/agent.go:86-108`（collectKeyPaths 接收 sshConfigPath）
 - Modify: `internal/agent/builtin_agent.go:32-54`（GetBuiltInAgent/newBuiltInAgent/init 传参）
-- Modify: `cmd/ssh-multihop/daemon.go:301,325`（shutdown 处传零值 LoadOptions）
+- Modify: `cmd/ssh-multihop/daemon.go:189,301,325`（三处调用点过渡: 传零值 `agent.LoadOptions{}`; :189 所在外部 agent 块由 Task 4 重写, 此处只保编译绿）
+- Modify: `internal/connection/builder.go:235`（第四处调用点过渡: `agentpkg.GetBuiltInAgent(agent.LoadOptions{})`; 本任务只改签名调用, 不触不修清单其他区域）
 - Test: `internal/agent/agent_options_test.go`
 
 **Interfaces:**
@@ -728,12 +790,16 @@ func TestInitialize_ExplicitModeLoadsGoodKey(t *testing.T) {
 	assert.Equal(t, 1, ga.GetKeyCount())
 }
 
-func TestInitialize_AutoModeKeepsCurrentBehavior(t *testing.T) {
+func TestInitialize_AutoModeBadConfigErrorsLikeToday(t *testing.T) {
+	// 现状行为回归: ssh config 解析失败 -> LoadKeys(nil) -> NoUsableKeysError（agent.go:43-64 现状）。
+	// 确定性锚: 用目录当 config —— os.Open(目录) 成功但首次 Read 得 EISDIR,
+	// Decode 必失败且 errors.Is(err, fs.ErrNotExist)==false（不落 "用默认 key" 分支）,
+	// 结果不依赖本机 ~/.ssh 的 key 状态。
 	ga, err := NewGoAgent()
 	require.NoError(t, err)
-	// auto 模式: 不出错即通过（零 key 或 N key 均为现状行为）
-	err = ga.Initialize(LoadOptions{})
-	require.NoError(t, err)
+	err = ga.Initialize(LoadOptions{SSHConfigPath: t.TempDir()})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no usable SSH keys found")
 }
 ```
 
@@ -765,9 +831,8 @@ func (a *GoAgent) Initialize(opts LoadOptions) error {
 		if err != nil {
 			zap.L().Warn("Failed to collect key paths from SSH config, using defaults only", zap.Error(err))
 		}
-		if keyPaths == nil {
-			keyPaths = a.keyLoader.CollectDefaultKeyPaths()
-		}
+		// 注意: 不加 "keyPaths == nil -> 默认 key" 回落——现状（agent.go:43-48）解析失败即
+		// LoadKeys(nil) -> NoUsableKeysError, auto 模式字节级不变（BCD I2, 盲审 r1 P1-2）。
 		loaded, err := a.keyLoader.LoadKeys(keyPaths)
 		if err != nil {
 			if _, ok := err.(*NoUsableKeysError); ok {
@@ -823,7 +888,7 @@ git commit -m "feat(agent): Initialize accepts LoadOptions for explicit key mode
 - Consumes: Task 1 `daemoncfg.Load/LoadDefault/LoadEnvFile/ExplicitKeys/ResolvedSSHConfigPath/ResolvedKeyPaths`；Task 3 `agent.LoadOptions/GetBuiltInAgent`。
 - Produces: 无新接口（装配层）。`runDaemon` 在 explicit 失败时返回 error -> urfave/cli 以非 0 退出。
 
-- [ ] **Step 1: 写 flag 层失败测试（追加到 daemon_test.go）**
+- [ ] **Step 1: 写失败测试（flag 层 + 装配层）**
 
 ```go
 func TestDaemonCommand_Flags(t *testing.T) {
@@ -835,7 +900,61 @@ func TestDaemonCommand_Flags(t *testing.T) {
 	assert.True(t, names["env-file"], "--env-file must exist")
 	assert.False(t, names["passphrase-socket"], "--passphrase-socket must be removed")
 }
+
+// startFakeAgent 起一个真实的进程内 ssh-agent（非 mock）, 返回 socket 路径。
+func startFakeAgent(t *testing.T) string {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := ssh.NewSignerFromKey(priv)
+	require.NoError(t, err)
+	ag := agent.NewKeyring()
+	require.NoError(t, ag.Add(agent.AddedKey{PrivateKey: priv}))
+	l, err := net.Listen("unix", filepath.Join(t.TempDir(), "agent.sock"))
+	require.NoError(t, err)
+	srv := agent.NewServer(ag)
+	go srv.Serve(l)
+	t.Cleanup(l.Close)
+	return l.Addr().String()
+}
+
+func TestInitKeysForRun_ExplicitBadKeyFailsWithoutExternalAgent(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "") // 无外部 agent
+	cfg := &daemoncfg.Config{Keys: []daemoncfg.KeySpec{{Path: "/nonexistent/k"}}}
+	err := initKeysForRun(cfg, "")
+	require.Error(t, err, "explicit 模式任一 key 失败必须报错（runDaemon 返回 error -> 退出非 0）")
+	assert.Contains(t, err.Error(), "/nonexistent/k")
+}
+
+func TestInitKeysForRun_ExplicitStillValidatesWithExternalAgent(t *testing.T) {
+	// spec I1 核心: SSH_AUTH_SOCK 可用不得豁免 explicit 校验
+	t.Setenv("SSH_AUTH_SOCK", startFakeAgent(t))
+	cfg := &daemoncfg.Config{Keys: []daemoncfg.KeySpec{{Path: "/nonexistent/k"}}}
+	err := initKeysForRun(cfg, "")
+	require.Error(t, err, "外部 agent 存在时 explicit 坏 key 仍必须失败")
+}
+
+func TestInitKeysForRun_ExplicitGoodKeySucceeds(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+	dir := t.TempDir()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	block, err := ssh.MarshalPrivateKey(priv, "ok")
+	require.NoError(t, err)
+	keyPath := filepath.Join(dir, "id_ok")
+	require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(block), 0o600))
+	cfg := &daemoncfg.Config{Keys: []daemoncfg.KeySpec{{Path: keyPath}}}
+	require.NoError(t, initKeysForRun(cfg, ""))
+}
+
+func TestInitKeysForRun_AutoWithExternalAgentTakesAgentPath(t *testing.T) {
+	// auto 模式 + 外部 agent: 不初始化内置 agent, 返回 nil（现状短路语义）
+	t.Setenv("SSH_AUTH_SOCK", startFakeAgent(t))
+	require.NoError(t, initKeysForRun(&daemoncfg.Config{}, ""))
+}
 ```
+
+测试注意: `GetBuiltInAgent` 是 sync.Once 单例，跨测试共享——本组测试全部走「失败路径」或「外部 agent 短路路径」，唯一命中初始化的是 `ExplicitGoodKeySucceeds`（其断言 nil error 对缓存态同样成立），测试间无顺序依赖。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -857,7 +976,7 @@ Flags 块 :98-102 的 `--passphrase-socket` 替换为:
 },
 ```
 
-runDaemon: 删 :119 `passphraseSocketPath`、:131-139 默认 socket 路径、:147-151 socket 目录创建、:196-205 passphrase socket 启动/`defer Stop`、`connection.PassphraseSocket` 相关 import 使用。替换为:
+runDaemon: 删 :119 `passphraseSocketPath`、:131-139 默认 socket 路径、:147-151 socket 目录创建、:156 日志的 `passphrase_socket` 字段、:196-205 passphrase socket 启动/`defer Stop`、`connection.PassphraseSocket` 相关 import 使用。替换为:
 
 ```go
 configFlag := c.String("config")
@@ -873,10 +992,14 @@ if configFlag != "" {
 	if err != nil {
 		return fmt.Errorf("failed to load default config: %w", err)
 	}
+	configFlag, _ = daemoncfg.DefaultPath() // S1: 默认路径也实打日志（可能为空串, 仅日志用途）
 }
+envLoaded := 0
 if envFile := c.String("env-file"); envFile != "" {
-	if err := daemoncfg.LoadEnvFile(envFile); err != nil {
-		return fmt.Errorf("failed to load env file: %w", err)
+	var envErr error
+	envLoaded, envErr = daemoncfg.LoadEnvFile(envFile)
+	if envErr != nil {
+		return fmt.Errorf("failed to load env file: %w", envErr)
 	}
 }
 if err := cfg.ResolvedKeyPaths(); err != nil {
@@ -890,35 +1013,49 @@ zap.L().Info("Daemon configuration loaded",
 	zap.String("config", configFlag),
 	zap.Bool("explicit_keys", cfg.ExplicitKeys()),
 	zap.Int("keys", len(cfg.Keys)),
+	zap.Int("env_vars_loaded", envLoaded),
 	zap.String("ssh_config", sshConfigPath))
 ```
 
-外部 agent 块 :167-194 替换（I1 与 SSH_AUTH_SOCK 解耦, I2 保持现状）:
+装配层 key 初始化提取为可测函数（同文件 daemon.go, runDaemon 调用）:
 
 ```go
-externalSocket, keyCount, err := agent.CheckExternalAgent()
-if err != nil {
-	zap.L().Warn("External SSH agent check failed", zap.Error(err))
-}
-if cfg.ExplicitKeys() {
-	// Strict mode: configured keys must load regardless of any external agent.
-	if _, err := agent.GetBuiltInAgent(agent.LoadOptions{Keys: cfg.Keys, SSHConfigPath: sshConfigPath}); err != nil {
-		return fmt.Errorf("failed to load configured SSH keys: %w", err)
+// initKeysForRun initializes key material per config mode.
+// Explicit mode is fatal on any key failure; auto mode keeps today's lenient behavior.
+func initKeysForRun(cfg *daemoncfg.Config, sshConfigPath string) error {
+	externalSocket, keyCount, err := agent.CheckExternalAgent()
+	if err != nil {
+		zap.L().Warn("External SSH agent check failed", zap.Error(err))
 	}
-	if externalSocket != "" {
-		zap.L().Info("Configured keys loaded; external agent preferred for authentication",
-			zap.String("socket", externalSocket))
+	if cfg.ExplicitKeys() {
+		// Strict mode: configured keys must load regardless of any external agent.
+		if _, err := agent.GetBuiltInAgent(agent.LoadOptions{Keys: cfg.Keys, SSHConfigPath: sshConfigPath}); err != nil {
+			return fmt.Errorf("failed to load configured SSH keys: %w", err)
+		}
+		if externalSocket != "" {
+			zap.L().Info("Configured keys loaded; external agent preferred for authentication",
+				zap.String("socket", externalSocket))
+		}
+		return nil
 	}
-} else if err == nil && externalSocket != "" && keyCount > 0 {
-	zap.L().Info("Using existing SSH agent",
-		zap.String("socket", externalSocket),
-		zap.Int("keys", keyCount))
-} else {
+	if err == nil && externalSocket != "" && keyCount > 0 {
+		zap.L().Info("Using existing SSH agent",
+			zap.String("socket", externalSocket),
+			zap.Int("keys", keyCount))
+		return nil
+	}
+	// CleanupOrphanedAgents 保留现状调用（pure Go agent 下为 no-op, 行为零变化）
+	if err := agent.CleanupOrphanedAgents(); err != nil {
+		zap.L().Warn("Failed to clean up orphaned SSH agents", zap.Error(err))
+	}
 	if _, err := agent.GetBuiltInAgent(agent.LoadOptions{SSHConfigPath: sshConfigPath}); err != nil {
 		zap.L().Warn("Failed to initialize built-in SSH agent", zap.Error(err))
 	}
+	return nil
 }
 ```
+
+runDaemon 中原 :167-194 块替换为 `if err := initKeysForRun(cfg, sshConfigPath); err != nil { return err }`。
 
 svc 创建后（:233 之后、svc.Start 之前）注入（**放在本任务不做**——`SetSSHConfigPath` 由 Task 5 引入, 本任务只算出 `sshConfigPath` 并打日志, 避免引用尚不存在的方法）:
 
@@ -952,7 +1089,7 @@ git commit -m "feat(daemon): config/env-file driven key setup, remove passphrase
 - Modify: `internal/forwarding/ssh_helper.go:22-28`（加 configPath 参数）
 - Modify: `internal/service/forward_service.go`（`sshConfigPath` 字段 + `SetSSHConfigPath`；:88/:119 hopResolver 闭包；`buildHopsFromSignature` :1106-1110 改用字段）
 - Modify: `cmd/ssh-multihop/daemon.go`（svc 创建后注入: `if sshConfigPath != "" { svc.SetSSHConfigPath(sshConfigPath) }`）
-- Test: `internal/forwarding/ssh_helper_test.go`（追加参数化用例）
+- Test: `internal/forwarding/ssh_helper_test.go`（既有用例同步加 configPath 参数 + 追加参数化用例; 簿记项由编译兜底）
 
 **Interfaces:**
 - Consumes: Task 4 的 `svc.SetSSHConfigPath(path string)`。
