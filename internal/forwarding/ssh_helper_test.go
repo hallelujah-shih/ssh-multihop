@@ -52,26 +52,19 @@ func TestBuildHopChainFromSSHConfig_CircularReference(t *testing.T) {
 	t.Skip("Requires SSH config file setup")
 }
 
-func TestBuildHopChainFromSSHConfig_EmptyPathFallsBackToDefault(t *testing.T) {
-	// Regression for current semantics: empty configPath must keep the
-	// pre-change behavior (default ~/.ssh/config via RUID). Any error is
-	// environment-dependent; the contract under test is "no panic".
-	_, err := BuildHopChainFromSSHConfig("definitely-not-a-host-xyz", "")
-	_ = err
-}
-
 func TestBuildHopChainFromSSHConfig_ExplicitPathUsed(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config")
 	content := "Host myjumphost\n  HostName 127.0.0.1\n  User test\n"
 	require.NoError(t, os.WriteFile(cfgPath, []byte(content), 0o600))
 
-	_, err := BuildHopChainFromSSHConfig("myjumphost", cfgPath)
-	// The host exists without ProxyJump: resolution must succeed. If it
-	// errors, it must not be a config-parse failure (explicit path was used).
-	if err != nil {
-		assert.NotContains(t, err.Error(), "failed to parse SSH config")
-	}
+	chain, err := BuildHopChainFromSSHConfig("myjumphost", cfgPath)
+	require.NoError(t, err)
+	// 内容断言是判别位: 忽略 configPath 恒用默认时, myjumphost 未命中,
+	// HostName 回落为 host 名本身而非 127.0.0.1 -> 红
+	require.NotEmpty(t, chain)
+	assert.Equal(t, "127.0.0.1", chain[0].HostName)
+	assert.Equal(t, "test", chain[0].User)
 }
 
 func TestResolveProxyJumpChain_Simple(t *testing.T) {
