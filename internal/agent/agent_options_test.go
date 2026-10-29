@@ -47,3 +47,19 @@ func TestInitialize_AutoModeBadConfigErrorsLikeToday(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no usable SSH keys found")
 }
+
+// TestGetBuiltInAgent_InitFailureIsCachedAndRethrown consumes the process-wide
+// singleton: once it runs, globalBuiltInAgentOnce is burned for the whole test
+// binary. No other test in this package may rely on GetBuiltInAgent's init
+// state (currently none calls it; keep it that way).
+func TestGetBuiltInAgent_InitFailureIsCachedAndRethrown(t *testing.T) {
+	opts := LoadOptions{Keys: []daemoncfg.KeySpec{{Path: "/nonexistent/t3fix"}}}
+
+	ag1, err1 := GetBuiltInAgent(opts)
+	require.Error(t, err1)
+	assert.Nil(t, ag1)
+
+	ag2, err2 := GetBuiltInAgent(opts)
+	require.Error(t, err2, "cached init failure must be rethrown on every call")
+	assert.Nil(t, ag2, "no silent second initialization may yield a usable agent")
+}

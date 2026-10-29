@@ -25,17 +25,17 @@ type BuiltInAgent struct {
 
 // globalBuiltInAgent is the singleton instance
 var globalBuiltInAgent *BuiltInAgent
+var globalBuiltInAgentErr error
 var globalBuiltInAgentOnce sync.Once
 
 // GetBuiltInAgent returns the singleton built-in agent instance,
-// initializing it on first use. On failure the error is cached by sync.Once:
+// initializing it on first use. On failure the error is cached:
 // there is no silent second initialization; later calls ignore opts.
 func GetBuiltInAgent(opts LoadOptions) (*BuiltInAgent, error) {
-	var initErr error
 	globalBuiltInAgentOnce.Do(func() {
-		globalBuiltInAgent, initErr = newBuiltInAgent(opts)
+		globalBuiltInAgent, globalBuiltInAgentErr = newBuiltInAgent(opts)
 	})
-	return globalBuiltInAgent, initErr
+	return globalBuiltInAgent, globalBuiltInAgentErr
 }
 
 // newBuiltInAgent creates and initializes a built-in agent.
