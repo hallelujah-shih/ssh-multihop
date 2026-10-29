@@ -102,31 +102,10 @@ func (kl *KeyLoader) tryLoadKey(keyPath string) *agent.AddedKey {
 		return nil
 	}
 
-	// Try to load corresponding certificate file
-	// Certificate file naming convention: <key>-cert.pub
-	certPath := keyPath + "-cert.pub"
-	var cert *ssh.Certificate
-
-	if certBytes, err := os.ReadFile(certPath); err == nil {
-		pubKey, err := ssh.ParsePublicKey(certBytes)
-		if err == nil {
-			if c, ok := pubKey.(*ssh.Certificate); ok {
-				cert = c
-				zap.L().Debug("Loaded certificate for key",
-					zap.String("key", keyPath),
-					zap.String("certificate", certPath))
-			}
-		}
+	addedKey, err := withCert(keyPath, privateKey)
+	if err != nil {
+		return nil
 	}
-
-	addedKey := &agent.AddedKey{
-		PrivateKey:       privateKey, // Raw private key (*rsa.PrivateKey, *ed25519.PrivateKey, etc.)
-		Certificate:      cert,
-		Comment:          filepath.Base(keyPath),
-		LifetimeSecs:     0,
-		ConfirmBeforeUse: false,
-	}
-
 	return addedKey
 }
 
