@@ -69,7 +69,7 @@ func (a *GoAgent) Initialize(opts LoadOptions) error {
 Please ensure at least one of the following:
 1. Add an unencrypted key to ~/.ssh/ (id_ed25519, id_rsa, etc.)
 2. Add an unencrypted key in SSH config with IdentityFile
-3. Keys with passphrases are not supported in daemon mode
+3. Encrypted keys are supported via the daemon config file (--config: keys[].path + passphrase_env)
 
 Keys checked: %d`, len(keyPaths))
 			}
