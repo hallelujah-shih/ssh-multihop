@@ -23,7 +23,7 @@ make dev                # Verbose development build
 # Testing - Run a single test
 go test ./internal/forwarding -v -run TestLocalListenToRemote_BasicLifecycle
 go test -v -run "TestName" ./package/path
-go test ./internal/api -tags=integration -v -timeout 30s
+go test ./internal/api -tags=integration -v -timeout 120s
 
 # All tests
 make test               # Run all tests

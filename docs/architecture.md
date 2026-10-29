@@ -588,14 +588,14 @@ After=network-online.target
 
 [Service]
 User=shih
-ExecStart=/opt/forward/ssh-multihop daemon --config /home/shih/.ssh-multihop/config.yaml --env-file /home/shih/.ssh-multihop/env --db /opt/forward/mydb.db --port 28080
+ExecStart=/opt/forward/ssh-multihop daemon --config /opt/forward/config.yaml --env-file /opt/forward/env --db /opt/forward/mydb.db --port 28080
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-权限事实：/opt/forward 对 shih 只读可执行，db 已由 shih 属主，config/env/keys 均在 /home/shih 下，unit 无需特权目录写权限。
+权限事实：/opt/forward 属 shih 可写（db/config/env 同目录），keys 在 /home/shih/.ssh 下，unit 无需特权目录写权限。
 
 ## 性能优化总结
 

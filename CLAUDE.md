@@ -103,6 +103,7 @@ internal/
 ├── api/                   # REST API handlers and server
 ├── config/                # SSH config parser
 ├── connection/            # SSH connection management
+├── daemoncfg/             # Daemon config loading (YAML + env file)
 ├── db/                    # Database layer (SQLite via GORM)
 ├── forwarding/            # Forward implementations (3 types)
 ├── service/              # ForwardService (lifecycle management)
