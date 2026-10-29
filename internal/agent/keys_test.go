@@ -72,6 +72,18 @@ func TestLoadSpecs_MissingEnvVarFailsWithPathAndVarName(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), keyPath)
 	assert.Contains(t, err.Error(), "ABSENT_VAR_XYZ")
+	assert.Contains(t, err.Error(), "not set in environment")
+}
+
+func TestLoadSpecs_EncryptedKeyWithoutPassphraseEnvFails(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := writeEncryptedKey(t, dir, "id_noenv", "pw")
+
+	kl := NewKeyLoader(mustUserCtx(t))
+	_, err := kl.LoadSpecs([]daemoncfg.KeySpec{{Path: keyPath}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), keyPath)
+	assert.Contains(t, err.Error(), "no passphrase_env")
 }
 
 func TestLoadSpecs_MissingFileFails(t *testing.T) {
