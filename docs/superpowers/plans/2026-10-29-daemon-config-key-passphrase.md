@@ -312,7 +312,8 @@ import (
 )
 
 func TestLoadEnvFile_MissingFileIsError(t *testing.T) {
-	require.Error(t, LoadEnvFile(filepath.Join(t.TempDir(), "absent")))
+	_, err := LoadEnvFile(filepath.Join(t.TempDir(), "absent"))
+	require.Error(t, err)
 }
 
 func TestLoadEnvFile_ParsesValuesAndStripsPairedQuotes(t *testing.T) {
