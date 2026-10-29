@@ -74,3 +74,32 @@ func TestLoadEnvFile_WarnsOnLoosePermissions(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { os.Unsetenv("LOOSE") })
 }
+
+func TestLoadEnvFile_QuoteStrippingStripsOnlyPairedSurroundingQuotes(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "env")
+	content := "UQ1=\"unterminated\nUQ2=unterminated\"\nUQ3=\"in\"ner\"\nUQ4='mix\"ed'\nUQ5=\"\"\n"
+	require.NoError(t, os.WriteFile(p, []byte(content), 0o600))
+
+	n, err := LoadEnvFile(p)
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
+	t.Cleanup(func() {
+		os.Unsetenv("UQ1")
+		os.Unsetenv("UQ2")
+		os.Unsetenv("UQ3")
+		os.Unsetenv("UQ4")
+		os.Unsetenv("UQ5")
+	})
+
+	for name, want := range map[string]string{
+		"UQ1": "\"unterminated",
+		"UQ2": "unterminated\"",
+		"UQ3": "in\"ner",
+		"UQ4": "mix\"ed",
+		"UQ5": "",
+	} {
+		got, ok := os.LookupEnv(name)
+		require.True(t, ok, name)
+		assert.Equal(t, want, got, name)
+	}
+}
