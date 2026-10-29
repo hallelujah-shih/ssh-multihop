@@ -3,13 +3,17 @@ package forwarding
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/hallelujah-shih/ssh-multihop/internal/connection"
+	"github.com/hallelujah-shih/ssh-multihop/internal/db"
 	"github.com/hallelujah-shih/ssh-multihop/internal/tunnel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 // TestLocalListenToRemote_BasicLifecycle tests the basic lifecycle of a forward
@@ -499,4 +503,76 @@ func TestLocalListenToRemote_StopIdempotent(t *testing.T) {
 	}
 
 	_ = lf2.Stop()
+}
+
+func TestLocalListenToRemote_E2EProbeHealthyKeepsRunning(t *testing.T) {
+	zap.ReplaceGlobals(zap.NewNop())
+
+	server := newTestSSHServer(t)
+	pool, hops := newTestConnectionManager(t, server)
+	echoL := startEchoService(t) // direct-tcpip relay target must be dialable
+	shrinkE2EProbeTimeout(t, 50*time.Millisecond)
+
+	lf := NewLocalListenToRemote("127.0.0.1:0", echoL.Addr().String(), "e2e-llr-healthy", db.NewTestDB(t), pool, hops)
+	lf.e2eInterval = 100 * time.Millisecond
+	require.NoError(t, lf.Start(t.Context()))
+	defer func() { _ = lf.Stop() }()
+
+	// Fixed wait ≥5×interval: several probes must have run and left us running.
+	time.Sleep(700 * time.Millisecond)
+	assert.Equal(t, StatusRunning, lf.Status())
+}
+
+func TestLocalListenToRemote_E2EProbeFailDies(t *testing.T) {
+	zap.ReplaceGlobals(zap.NewNop())
+
+	server := newTestSSHServer(t)
+	server.setDirectTCPDialFail(true) // sshd connect-failed → definitive death
+	pool, hops := newTestConnectionManager(t, server)
+	testDB := db.NewTestDB(t)
+	shrinkE2EProbeTimeout(t, 50*time.Millisecond)
+
+	forwardID := "e2e-llr-fail"
+	lf := NewLocalListenToRemote("127.0.0.1:0", "127.0.0.1:1", forwardID, testDB, pool, hops)
+	lf.e2eInterval = 100 * time.Millisecond
+	require.NoError(t, lf.Start(t.Context()))
+	localPort := lf.listener.Addr().(*net.TCPAddr).Port
+
+	waitFor(t, 2*time.Second, func() bool {
+		return lf.Status() == StatusError
+	})
+
+	status, err := testDB.GetStatus(forwardID)
+	require.NoError(t, err)
+	assert.Equal(t, "error", status.Status)
+	assert.True(t, strings.HasPrefix(status.ErrorMessage, "e2e probe failed"),
+		"error_message must carry the e2e prefix, got %q", status.ErrorMessage)
+
+	// The failure path cancels the context: the local listener must go away.
+	waitFor(t, 2*time.Second, func() bool {
+		c, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), 200*time.Millisecond)
+		if derr != nil {
+			return true
+		}
+		_ = c.Close()
+		return false
+	})
+}
+
+func TestLocalListenToRemote_E2EProbeProhibitedKeepsRunning(t *testing.T) {
+	zap.ReplaceGlobals(zap.NewNop())
+
+	server := newTestSSHServer(t)
+	server.setDirectTCPRejectProhibited(true) // PermitOpen policy → unknown
+	pool, hops := newTestConnectionManager(t, server)
+	shrinkE2EProbeTimeout(t, 50*time.Millisecond)
+
+	lf := NewLocalListenToRemote("127.0.0.1:0", "127.0.0.1:1", "e2e-llr-prohibited", db.NewTestDB(t), pool, hops)
+	lf.e2eInterval = 100 * time.Millisecond
+	require.NoError(t, lf.Start(t.Context()))
+	defer func() { _ = lf.Stop() }()
+
+	// Fixed wait >probeTimeout+2×interval: unknown verdicts must not touch state.
+	time.Sleep(700 * time.Millisecond)
+	assert.Equal(t, StatusRunning, lf.Status())
 }

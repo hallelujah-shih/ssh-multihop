@@ -1,10 +1,14 @@
 package forwarding
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/hallelujah-shih/ssh-multihop/internal/config"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Helper function to check if a string contains a substring
@@ -46,6 +50,21 @@ func TestBuildHopChainFromSSHConfig_CircularReference(t *testing.T) {
 
 	// For now, we'll skip this as it requires file system setup
 	t.Skip("Requires SSH config file setup")
+}
+
+func TestBuildHopChainFromSSHConfig_ExplicitPathUsed(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config")
+	content := "Host myjumphost\n  HostName 127.0.0.1\n  User test\n"
+	require.NoError(t, os.WriteFile(cfgPath, []byte(content), 0o600))
+
+	chain, err := BuildHopChainFromSSHConfig("myjumphost", cfgPath)
+	require.NoError(t, err)
+	// 内容断言是判别位: 忽略 configPath 恒用默认时, myjumphost 未命中,
+	// HostName 回落为 host 名本身而非 127.0.0.1 -> 红
+	require.NotEmpty(t, chain)
+	assert.Equal(t, "127.0.0.1", chain[0].HostName)
+	assert.Equal(t, "test", chain[0].User)
 }
 
 func TestResolveProxyJumpChain_Simple(t *testing.T) {

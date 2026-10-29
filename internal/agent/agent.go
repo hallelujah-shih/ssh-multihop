@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/hallelujah-shih/ssh-multihop/internal/config"
+	"github.com/hallelujah-shih/ssh-multihop/internal/daemoncfg"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -37,21 +38,33 @@ func NewGoAgent() (*GoAgent, error) {
 	}, nil
 }
 
-// Initialize loads keys and starts the socket server.
-func (a *GoAgent) Initialize() error {
-	// Parse SSH config to collect all configured keys
-	keyPaths, err := a.collectKeyPaths()
-	if err != nil {
-		zap.L().Warn("Failed to collect key paths from SSH config, using defaults only",
-			zap.Error(err))
-		// Continue with default keys only
-	}
+// LoadOptions configures how Initialize loads key material.
+// Keys selects explicit mode (strict loading); empty Keys is auto mode.
+type LoadOptions struct {
+	Keys          []daemoncfg.KeySpec
+	SSHConfigPath string
+}
 
-	// Load all keys (only unencrypted keys)
-	keys, err := a.keyLoader.LoadKeys(keyPaths)
-	if err != nil {
-		if _, ok := err.(*NoUsableKeysError); ok {
-			return fmt.Errorf(`no usable SSH keys found
+// Initialize loads keys and starts the socket server.
+func (a *GoAgent) Initialize(opts LoadOptions) error {
+	var keys []*agent.AddedKey
+	if len(opts.Keys) > 0 {
+		loaded, err := a.keyLoader.LoadSpecs(opts.Keys)
+		if err != nil {
+			return err
+		}
+		keys = loaded
+	} else {
+		keyPaths, err := a.collectKeyPaths(opts.SSHConfigPath)
+		if err != nil {
+			zap.L().Warn("Failed to collect key paths from SSH config, using defaults only", zap.Error(err))
+		}
+		// 注意: 不加 "keyPaths == nil -> 默认 key" 回落——现状（agent.go:43-48）解析失败即
+		// LoadKeys(nil) -> NoUsableKeysError, auto 模式字节级不变（BCD I2, 盲审 r1 P1-2）。
+		loaded, err := a.keyLoader.LoadKeys(keyPaths)
+		if err != nil {
+			if _, ok := err.(*NoUsableKeysError); ok {
+				return fmt.Errorf(`no usable SSH keys found
 
 Please ensure at least one of the following:
 1. Add an unencrypted key to ~/.ssh/ (id_ed25519, id_rsa, etc.)
@@ -59,8 +72,10 @@ Please ensure at least one of the following:
 3. Keys with passphrases are not supported in daemon mode
 
 Keys checked: %d`, len(keyPaths))
+			}
+			return fmt.Errorf("failed to load keys: %w", err)
 		}
-		return fmt.Errorf("failed to load keys: %w", err)
+		keys = loaded
 	}
 
 	// Add keys to memory agent
@@ -83,10 +98,14 @@ Keys checked: %d`, len(keyPaths))
 }
 
 // collectKeyPaths collects all key paths from SSH config and defaults.
-func (a *GoAgent) collectKeyPaths() ([]string, error) {
+func (a *GoAgent) collectKeyPaths(sshConfigPath string) ([]string, error) {
 	// Try to parse SSH config
+	path := sshConfigPath
+	if path == "" {
+		path = a.userCtx.GetSSHConfigPath()
+	}
 	parser := config.NewParser()
-	_, err := parser.ParseConfig(a.userCtx.GetSSHConfigPath())
+	_, err := parser.ParseConfig(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// SSH config doesn't exist, use default keys

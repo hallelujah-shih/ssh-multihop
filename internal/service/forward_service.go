@@ -54,6 +54,10 @@ type ForwardService struct {
 	sshConfigCache map[string]*config.SSHConfig // configPath -> parsed SSH config
 	cacheMu        sync.RWMutex                 // Protect sshConfigCache
 
+	// sshConfigPath overrides the SSH config location (daemon config ssh_dir);
+	// empty means the default ~/.ssh/config (RUID semantics)
+	sshConfigPath string
+
 	// hopResolver resolves a hostname to SSH hop chain (injectable for tests)
 	hopResolver func(hostname string) ([]*tunnel.HopConfig, error)
 }
@@ -85,7 +89,10 @@ func New(database *db.Database) (*ForwardService, error) {
 		maxBackoff:          120 * time.Second, // max backoff 120s
 		pendingStarts:       make(map[string]bool),
 		sshConfigCache:      make(map[string]*config.SSHConfig),
-		hopResolver:         forwarding.BuildHopChainFromSSHConfig,
+	}
+
+	s.hopResolver = func(host string) ([]*tunnel.HopConfig, error) {
+		return forwarding.BuildHopChainFromSSHConfig(host, s.sshConfigPath)
 	}
 
 	// Create connection manager with hop config provider (closure captures s)
@@ -116,7 +123,10 @@ func NewWithContext(ctx context.Context, database *db.Database) (*ForwardService
 		maxBackoff:          120 * time.Second, // max backoff 120s
 		pendingStarts:       make(map[string]bool),
 		sshConfigCache:      make(map[string]*config.SSHConfig),
-		hopResolver:         forwarding.BuildHopChainFromSSHConfig,
+	}
+
+	s.hopResolver = func(host string) ([]*tunnel.HopConfig, error) {
+		return forwarding.BuildHopChainFromSSHConfig(host, s.sshConfigPath)
 	}
 
 	// Create connection manager with hop config provider (closure captures s)
@@ -127,6 +137,12 @@ func NewWithContext(ctx context.Context, database *db.Database) (*ForwardService
 	s.pool = pool
 
 	return s, nil
+}
+
+// SetSSHConfigPath overrides the SSH config location (daemon config ssh_dir).
+// Must be called before Start so hop resolution and the config cache use it.
+func (s *ForwardService) SetSSHConfigPath(path string) {
+	s.sshConfigPath = path
 }
 
 // Start starts all forwards from database
@@ -646,6 +662,144 @@ func (s *ForwardService) GetPoolStats() (map[string]interface{}, error) {
 	}, nil
 }
 
+// leakRecoveryAllowed reports whether fwd may attempt deny-branch cancel
+// recovery. A same-bind sibling (rll/rlr — they hold the remote listen)
+// occupies the bind unless it is fully stopped: running is the obvious
+// conflict, while pending/error — and a start still in flight in
+// pendingStarts — cover the concurrent-start window where two records would
+// retract each other's listener (flip-flop). A bind that fails to normalize
+// on either side makes the comparison undecidable and also counts as
+// occupied; raw strings are never compared, since "localhost:p" and
+// "127.0.0.1:p" are unequal strings for the same port. A failed listing
+// disables recovery outright — a flip-flop is worse than no auto-heal.
+func (s *ForwardService) leakRecoveryAllowed(fwd *db.Forward) bool {
+	all, err := s.db.ListForwardsWithStatus()
+	if err != nil {
+		zap.L().Warn("Leak recovery guard: cannot list forwards, disabling recovery",
+			zap.String("forward_id", fwd.ID),
+			zap.Error(err))
+		return false
+	}
+
+	myHost, myPort, myErr := util.ParseAddress(fwd.ListenAddr)
+	for _, other := range all {
+		if other.ForwardID == fwd.ID {
+			continue
+		}
+		// ForwardWithStatus.Type is a plain string; compare against the
+		// remote-listening types only.
+		if other.Type != string(db.RemoteListenToLocal) && other.Type != string(db.RemoteListenToRemote) {
+			continue
+		}
+		if myErr != nil {
+			// Self bind unparseable: undecidable against this sibling.
+			return false
+		}
+		host, port, otherErr := util.ParseAddress(other.ListenAddr)
+		if otherErr != nil {
+			// Sibling bind unparseable: undecidable comparison.
+			return false
+		}
+		if host != myHost || port != myPort {
+			continue
+		}
+		if other.Status == nil || *other.Status != "stopped" {
+			return false
+		}
+		s.pendingMu.Lock()
+		inFlight := s.pendingStarts[other.ForwardID]
+		s.pendingMu.Unlock()
+		if inFlight {
+			return false
+		}
+	}
+	return true
+}
+
+// buildForward constructs the concrete forward for fwd. For the
+// remote-listening types (rll/rlr) it wires the sibling guard into
+// AllowLeakRecovery; llr holds no remote listen and never opts in.
+func (s *ForwardService) buildForward(fwd *db.Forward) (forwarding.Forward, error) {
+	// Parse listen address
+	listenIP, listenPort, err := util.ParseAddress(fwd.ListenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid listen_addr: %w", err)
+	}
+
+	// Parse service address (servicePort used by RemoteListenToRemote)
+	_, servicePort, err := util.ParseAddress(fwd.ServiceAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid service_addr: %w", err)
+	}
+
+	// Resolve listen_host to get SSH hops
+	listenHops, err := s.getHopsForHost(fwd.ListenHost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve listen_host: %w", err)
+	}
+
+	// For local_listen_to_remote and remote_listen_to_remote, also need service_host hops
+	var serviceHops []*tunnel.HopConfig
+	if fwd.Type == db.LocalListenToRemote || fwd.Type == db.RemoteListenToRemote {
+		serviceHops, err = s.getHopsForHost(fwd.ServiceHost)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve service_host: %w", err)
+		}
+	}
+
+	// Build bind address string
+	bindAddr := fmt.Sprintf("%s:%d", listenIP, listenPort)
+
+	switch fwd.Type {
+	case db.LocalListenToRemote:
+		// For SSH -L forwarding, use the full service address from database
+		return forwarding.NewLocalListenToRemote(
+			bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
+			fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
+			fwd.ID,
+			s.db,
+			s.pool, // Connection pool for SSH connection reuse
+			serviceHops,
+		), nil
+
+	case db.RemoteListenToLocal:
+		rf := forwarding.NewRemoteListenToLocal(
+			bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
+			fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
+			fwd.ID,
+			s.db,
+			s.pool, // Connection pool for SSH connection reuse
+			listenHops,
+		)
+		// Sibling guard: two records on the same remote bind must not
+		// retract each other's listener (flip-flop).
+		rf.AllowLeakRecovery = s.leakRecoveryAllowed(fwd)
+		return rf, nil
+
+	case db.RemoteListenToRemote:
+		inf := forwarding.NewRemoteListenToRemote(
+			fwd.ListenAddr, // Full listen address (e.g., "127.0.0.1:11434")
+			fwd.ListenHost, // SSH hostname (e.g., "vmr.u24")
+			listenPort,     // Port number
+			listenHops,
+			fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:11434")
+			fwd.ServiceHost, // SSH hostname (e.g., "dc4")
+			servicePort,     // Port number
+			serviceHops,
+			fwd.ID,
+			s.db,
+			s.pool, // Connection pool for SSH connection reuse
+			fwd.MaxConns,
+		)
+		// Sibling guard: same as rll (see above).
+		inf.AllowLeakRecovery = s.leakRecoveryAllowed(fwd)
+		return inf, nil
+
+	default:
+		return nil, fmt.Errorf("unknown forward type: %s", fwd.Type)
+	}
+}
+
 // startForward starts a single forward
 func (s *ForwardService) startForward(fwd *db.Forward) error {
 	zap.L().Debug("Starting forward",
@@ -655,85 +809,12 @@ func (s *ForwardService) startForward(fwd *db.Forward) error {
 		zap.String("service_host", fwd.ServiceHost),
 		zap.String("service_addr", fwd.ServiceAddr))
 
-	// Parse listen address
-	listenIP, listenPort, err := util.ParseAddress(fwd.ListenAddr)
+	forward, err := s.buildForward(fwd)
 	if err != nil {
-		return fmt.Errorf("invalid listen_addr: %w", err)
+		return err
 	}
 
-	// Parse service address (servicePort used by RemoteListenToRemote)
-	_, servicePort, err := util.ParseAddress(fwd.ServiceAddr)
-	if err != nil {
-		return fmt.Errorf("invalid service_addr: %w", err)
-	}
-
-	// Resolve listen_host to get SSH hops
-	listenHops, err := s.getHopsForHost(fwd.ListenHost)
-	if err != nil {
-		return fmt.Errorf("failed to resolve listen_host: %w", err)
-	}
-
-	// For local_listen_to_remote and remote_listen_to_remote, also need service_host hops
-	var serviceHops []*tunnel.HopConfig
-	if fwd.Type == db.LocalListenToRemote || fwd.Type == db.RemoteListenToRemote {
-		serviceHops, err = s.getHopsForHost(fwd.ServiceHost)
-		if err != nil {
-			return fmt.Errorf("failed to resolve service_host: %w", err)
-		}
-	}
-
-	// Build bind address string
-	bindAddr := fmt.Sprintf("%s:%d", listenIP, listenPort)
-
-	var wrapper ForwardWrapper
-
-	switch fwd.Type {
-	case db.LocalListenToRemote:
-		// For SSH -L forwarding, use the full service address from database
-		wrapper = ForwardWrapper{
-			Forward: forwarding.NewLocalListenToRemote(
-				bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
-				fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
-				fwd.ID,
-				s.db,
-				s.pool, // Connection pool for SSH connection reuse
-				serviceHops,
-			),
-		}
-
-	case db.RemoteListenToLocal:
-		wrapper = ForwardWrapper{
-			Forward: forwarding.NewRemoteListenToLocal(
-				bindAddr,        // Full bind address (e.g., "127.0.0.1:8888")
-				fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:8888" or "192.168.1.100:8888")
-				fwd.ID,
-				s.db,
-				s.pool, // Connection pool for SSH connection reuse
-				listenHops,
-			),
-		}
-
-	case db.RemoteListenToRemote:
-		wrapper = ForwardWrapper{
-			Forward: forwarding.NewRemoteListenToRemote(
-				fwd.ListenAddr, // Full listen address (e.g., "127.0.0.1:11434")
-				fwd.ListenHost, // SSH hostname (e.g., "vmr.u24")
-				listenPort,     // Port number
-				listenHops,
-				fwd.ServiceAddr, // Full service address (e.g., "127.0.0.1:11434")
-				fwd.ServiceHost, // SSH hostname (e.g., "dc4")
-				servicePort,     // Port number
-				serviceHops,
-				fwd.ID,
-				s.db,
-				s.pool, // Connection pool for SSH connection reuse
-				fwd.MaxConns,
-			),
-		}
-
-	default:
-		return fmt.Errorf("unknown forward type: %s", fwd.Type)
-	}
+	wrapper := ForwardWrapper{Forward: forward}
 
 	// Create context for this forward
 	ctx, cancel := context.WithCancel(s.ctx)
@@ -1037,12 +1118,15 @@ func (s *ForwardService) buildHopsFromSignature(sig connection.ConnectionSignatu
 		return []*tunnel.HopConfig{}, nil
 	}
 
-	// Get SSH config path
-	homeDir, err := util.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get home directory: %w", err)
+	// Get SSH config path (ssh_dir override, falling back to the default)
+	configPath := s.sshConfigPath
+	if configPath == "" {
+		homeDir, err := util.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get home directory: %w", err)
+		}
+		configPath = filepath.Join(homeDir, ".ssh", "config")
 	}
-	configPath := filepath.Join(homeDir, ".ssh", "config")
 
 	// Try to get from cache first
 	s.cacheMu.RLock()

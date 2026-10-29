@@ -13,23 +13,25 @@ import (
 // BuildHopChainFromSSHConfig builds a hop chain by parsing SSH config
 //
 // This function:
-// 1. Parses ~/.ssh/config
+// 1. Parses the SSH config at configPath (empty falls back to ~/.ssh/config)
 // 2. Looks up the target host
 // 3. Resolves ProxyJump chain
 // 4. Builds complete hop configuration
 //
 // Returns the hop chain (excluding "local" - only remote hops).
-func BuildHopChainFromSSHConfig(targetHost string) ([]*tunnel.HopConfig, error) {
-	// Get SSH config path
-	homeDir, err := util.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get home directory: %w", err)
+func BuildHopChainFromSSHConfig(targetHost, configPath string) ([]*tunnel.HopConfig, error) {
+	// Resolve SSH config path
+	if configPath == "" {
+		homeDir, err := util.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get home directory: %w", err)
+		}
+		configPath = filepath.Join(homeDir, ".ssh", "config")
 	}
-	configPath := filepath.Join(homeDir, ".ssh", "config")
 
 	// Parse SSH config
 	parser := config.NewParser()
-	_, err = parser.ParseConfig(configPath)
+	_, err := parser.ParseConfig(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse SSH config: %w", err)
 	}

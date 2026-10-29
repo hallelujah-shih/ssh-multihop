@@ -24,6 +24,9 @@ make build
 ```bash
 # 启动守护进程（带 REST API）
 ssh-multihop daemon --port 8080
+
+# 指定配置文件与口令环境变量文件
+ssh-multihop daemon --config ~/.ssh-multihop/config.yaml --env-file ~/.ssh-multihop/env
 ```
 
 ## 文档

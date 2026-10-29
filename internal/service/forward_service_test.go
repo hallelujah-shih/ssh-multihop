@@ -1,12 +1,15 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hallelujah-shih/ssh-multihop/internal/connection"
 	"github.com/hallelujah-shih/ssh-multihop/internal/db"
 	"github.com/hallelujah-shih/ssh-multihop/internal/tunnel"
 	"github.com/stretchr/testify/assert"
@@ -837,4 +840,25 @@ func TestPendingStartsConcurrentDifferentForwards(t *testing.T) {
 	// Verify all forwards were started (or attempted) without deadlocking
 	// The key test is that pendingStarts mechanism prevented race conditions
 	// The logs will show "Forward already starting, skipping" if the mechanism worked
+}
+
+// TestSetSSHConfigPath_PropagatesToHopResolution verifies the ssh_dir override
+// reaches hop resolution (S2): killing the field (always default path) turns
+// the HostName assertion red because "svcalias" is absent from ~/.ssh/config.
+func TestSetSSHConfigPath_PropagatesToHopResolution(t *testing.T) {
+	testDB := setupTestDB(t)
+	svc, err := NewWithContext(context.Background(), testDB)
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config")
+	content := "Host svcalias\n  HostName 127.0.0.1\n  User svcuser\n"
+	require.NoError(t, os.WriteFile(cfgPath, []byte(content), 0o600))
+	svc.SetSSHConfigPath(cfgPath)
+
+	hops, err := svc.buildHopsFromSignature(connection.ConnectionSignature{Hostname: "svcalias"})
+	require.NoError(t, err)
+	require.NotEmpty(t, hops)
+	assert.Equal(t, "127.0.0.1", hops[0].HostName)
+	assert.Equal(t, "svcuser", hops[0].User)
 }

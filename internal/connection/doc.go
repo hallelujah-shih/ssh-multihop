@@ -8,9 +8,8 @@
 //   - HealthChecker: monitors pooled connections and cancels the context of
 //     dead connections so forwards can react
 //   - SSHClientConfigBuilder: builds SSH client configs (keys, certificates,
-//     ssh-agent, passphrase socket)
+//     ssh-agent)
 //   - MultiplexedForward: creates SSH channels over pooled connections
-//   - PassphraseSocket: serves passphrases to key decryption over a UDS
 //
 // Reconnection of forwards is handled by the ForwardService layer; forwards
 // themselves fail fast.

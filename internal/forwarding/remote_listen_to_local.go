@@ -2,8 +2,10 @@ package forwarding
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,10 +55,20 @@ type RemoteListenToLocal struct {
 	// UDS support - when set, dial UDS instead of TCP
 	udsPath string
 
+	// AllowLeakRecovery opts this forward into deny-branch leak recovery:
+	// when the remote port probe classifies a start-deny as occupied, a
+	// cancel-tcpip-forward is sent on THIS session to retract a leaked
+	// listener and Listen is retried once. Default false keeps the batch-1
+	// behavior byte-for-byte. Set by ForwardService's sibling-bind guard.
+	AllowLeakRecovery bool
+
 	// Health monitoring
 	healthCheckInterval time.Duration
 	healthCheckTicker   *time.Ticker
 	healthCheckDone     chan struct{}
+
+	// E2E liveness probe cadence (set at construction, read-only afterwards)
+	e2eInterval time.Duration
 }
 
 // NewRemoteListenToLocal creates a new remote forward
@@ -79,6 +91,7 @@ func NewRemoteListenToLocal(remoteBindAddr, localAddr string, forwardID string, 
 		activeConns:         make(map[net.Conn]struct{}),
 		healthCheckInterval: RandomHealthCheckInterval(),
 		healthCheckDone:     make(chan struct{}),
+		e2eInterval:         RandomE2EProbeInterval(),
 	}
 }
 
@@ -177,13 +190,50 @@ func (rf *RemoteListenToLocal) Start(ctx context.Context) error {
 	// This creates a listener on the remote SSH server
 	listener, err := pooledConn.Client.Listen("tcp", rf.remoteBindAddr)
 	if err != nil {
-		// Release connection if listener creation fails
-		_ = rf.pool.Release(pooledConn, rf.forwardID)
-		zap.L().Error("Failed to listen on remote",
-			zap.String("forward", rf.String()),
-			zap.String("remote_bind", rf.remoteBindAddr),
-			zap.Error(err))
-		return fmt.Errorf("failed to create remote listener: %w", err)
+		// Annotate BEFORE releasing: after Release the pooled connection may be
+		// linger-closed concurrently, which would break the probe's session.
+		annotated := err
+		if strings.Contains(err.Error(), listenDeniedMarker) {
+			detail, cls := probeDeniedPort(pooledConn.Client, rf.remoteBindAddr)
+			if cls == listenOccupied && rf.AllowLeakRecovery {
+				released, cerr := cancelRemoteListener(pooledConn.Client, rf.remoteBindAddr)
+				if released {
+					// Single retry on the same session: the leaked listener
+					// was retracted, so the bind should succeed now.
+					listener, err = pooledConn.Client.Listen("tcp", rf.remoteBindAddr)
+					if err == nil {
+						zap.L().Info("Leak recovery: retracted leaked remote listener, re-listen succeeded",
+							zap.String("forward", rf.String()),
+							zap.String("remote_bind", rf.remoteBindAddr))
+					} else {
+						detail += "; cancel-tcpip-forward released the port but re-listen failed"
+						zap.L().Warn("Leak recovery retry failed",
+							zap.String("forward", rf.String()),
+							zap.Error(err))
+					}
+				} else {
+					detail += "; cancel-tcpip-forward attempted, released=false"
+					if cerr != nil {
+						detail += fmt.Sprintf(" (%v)", cerr)
+					}
+					zap.L().Warn("Leak recovery: cancel did not release the remote port",
+						zap.String("forward", rf.String()),
+						zap.String("remote_bind", rf.remoteBindAddr),
+						zap.Error(cerr))
+				}
+			}
+			if err != nil {
+				annotated = annotateDeniedWith(err, detail)
+			}
+		}
+		if err != nil {
+			_ = rf.pool.Release(pooledConn, rf.forwardID)
+			zap.L().Error("Failed to listen on remote",
+				zap.String("forward", rf.String()),
+				zap.String("remote_bind", rf.remoteBindAddr),
+				zap.Error(annotated))
+			return fmt.Errorf("failed to create remote listener: %w", annotated)
+		}
 	}
 
 	// Success! Store resources and start forward
@@ -223,7 +273,11 @@ func (rf *RemoteListenToLocal) Start(ctx context.Context) error {
 
 				// Close listener
 				if rf.listener != nil {
-					_ = rf.listener.Close()
+					if err := rf.listener.Close(); err != nil {
+						zap.L().Warn(cancelUndeliveredWarn,
+							zap.String("forward", rf.String()),
+							zap.Error(err))
+					}
 				}
 
 				zap.L().Info("Partial cleanup complete",
@@ -240,6 +294,9 @@ func (rf *RemoteListenToLocal) Start(ctx context.Context) error {
 
 	// Start health monitoring
 	rf.startHealthMonitoring(innerCtx)
+
+	// Start E2E liveness monitoring
+	rf.startE2EMonitoring(innerCtx)
 
 	// Start accept loop
 	rf.wg.Add(1) // Add acceptLoop to WaitGroup
@@ -463,7 +520,10 @@ func (rf *RemoteListenToLocal) cleanupMonitor(ctx context.Context) {
 		// Step 2: Close listener FIRST to stop accepting new connections
 		if rf.listener != nil {
 			if err := rf.listener.Close(); err != nil {
-				zap.L().Debug("Error closing listener", zap.Error(err))
+				zap.L().Warn(cancelUndeliveredWarn,
+					zap.String("forward", rf.String()),
+					zap.String("remote_bind", rf.remoteBindAddr),
+					zap.Error(err))
 			}
 		}
 
@@ -586,6 +646,73 @@ func (rf *RemoteListenToLocal) startHealthMonitoring(ctx context.Context) {
 	zap.L().Debug("Health monitoring started",
 		zap.String("forward", rf.String()),
 		zap.String("interval", rf.healthCheckInterval.String()))
+}
+
+// E2ECheck probes the full data path by exec-ing the /dev/tcp probe on the
+// pooled connection against this forward's own remote listener.
+func (rf *RemoteListenToLocal) E2ECheck() error {
+	if rf.Status() != StatusRunning {
+		return fmt.Errorf("forward not running (status: %s)", rf.Status())
+	}
+	if rf.listener == nil {
+		return fmt.Errorf("%w: listener is nil", errE2EUnknown)
+	}
+	if rf.pooledConn == nil || rf.pooledConn.Client == nil {
+		return fmt.Errorf("%w: no pooled connection", errE2EUnknown)
+	}
+	return probeThroughTunnel(rf.pooledConn.Client, rf.listener.Addr().String(), e2eProbeTimeout)
+}
+
+// startE2EMonitoring probes the full forwarding path on rf.e2eInterval. A
+// definitive path-death follows the health-failure path verbatim (warn, error
+// status, cancel); an inconclusive verdict only warns.
+func (rf *RemoteListenToLocal) startE2EMonitoring(ctx context.Context) {
+	rf.wg.Add(1)
+
+	go func() {
+		defer rf.wg.Done()
+		defer zap.L().Info("E2E monitoring stopped",
+			zap.String("forward", rf.String()))
+
+		ticker := time.NewTicker(rf.e2eInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-rf.healthCheckDone:
+				return
+			case <-ticker.C:
+				if err := rf.E2ECheck(); err != nil {
+					if errors.Is(err, errE2EUnknown) {
+						zap.L().Warn("E2E probe inconclusive",
+							zap.String("forward", rf.String()),
+							zap.Error(err))
+						continue
+					}
+
+					zap.L().Warn("E2E probe failed, setting error status",
+						zap.String("forward", rf.String()),
+						zap.Error(err))
+
+					// Set database status to error
+					rf.setErrorStatus(err.Error())
+
+					// Trigger unified cleanup by canceling context
+					// cleanupMonitor will handle all resource cleanup including closing listener
+					if rf.cancelFunc != nil {
+						rf.cancelFunc()
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	zap.L().Debug("E2E monitoring started",
+		zap.String("forward", rf.String()),
+		zap.String("interval", rf.e2eInterval.String()))
 }
 
 // Removed: attemptRepair, reconnect, and calculateBackoff methods

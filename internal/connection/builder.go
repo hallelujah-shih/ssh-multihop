@@ -18,10 +18,9 @@ import (
 // SSHClientConfigBuilder builds SSH client configurations from hop configurations.
 // SSHClientConfigBuilder builds SSH client configurations from hop configurations.
 type SSHClientConfigBuilder struct {
-	mu               sync.Mutex
-	agentEnabled     bool
-	isDaemon         bool // Running in daemon mode (no TTY)
-	passphraseSocket *PassphraseSocket
+	mu           sync.Mutex
+	agentEnabled bool
+	isDaemon     bool // Running in daemon mode (no TTY)
 }
 
 // NewSSHClientConfigBuilder creates a new SSH client config builder.
@@ -49,13 +48,6 @@ func NewSSHClientConfigBuilder() *SSHClientConfigBuilder {
 	}
 
 	return builder
-}
-
-// SetPassphraseSocket sets the passphrase socket for retrieving SSH key passphrases.
-func (b *SSHClientConfigBuilder) SetPassphraseSocket(ps *PassphraseSocket) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.passphraseSocket = ps
 }
 
 // Build creates an SSH client configuration from a hop configuration.
@@ -232,7 +224,7 @@ func (b *SSHClientConfigBuilder) trySSHAgent() (ssh.AuthMethod, error) {
 
 	// Fallback to built-in agent (pure in-memory agent)
 	// Only used if no external SSH agent is available
-	if builtInAgent, err := agentpkg.GetBuiltInAgent(); err == nil && builtInAgent.IsAvailable() {
+	if builtInAgent, err := agentpkg.GetBuiltInAgent(agentpkg.LoadOptions{}); err == nil && builtInAgent.IsAvailable() {
 		zap.L().Info("Using built-in in-memory SSH agent (fallback, no SSH_AUTH_SOCK)",
 			zap.Int("keys", builtInAgent.GetKeyCount()))
 
@@ -343,31 +335,6 @@ func (b *SSHClientConfigBuilder) parsePrivateKeyWithPassphrase(keyPath string) (
 		// Key is encrypted
 		zap.L().Debug("SSH key requires passphrase",
 			zap.String("key", keyPath))
-
-		// Try passphrase socket first
-		if b.passphraseSocket != nil {
-			// Parse the public key to get fingerprint
-			pubKey, err := ssh.ParsePublicKey(keyBytes)
-			if err != nil {
-				zap.L().Debug("Failed to parse public key for fingerprint",
-					zap.String("key", keyPath),
-					zap.Error(err))
-			} else {
-				fingerprint := ssh.FingerprintSHA256(pubKey)
-				if passphrase, ok := b.passphraseSocket.GetPassphrase(fingerprint); ok {
-					signer, err := ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(passphrase))
-					if err == nil {
-						zap.L().Debug("Successfully used passphrase from socket",
-							zap.String("key", keyPath),
-							zap.String("fingerprint", fingerprint))
-						return signer, nil
-					}
-					zap.L().Warn("Passphrase from socket failed",
-						zap.String("key", keyPath),
-						zap.Error(err))
-				}
-			}
-		}
 
 		// No interactive prompts in daemon mode
 		zap.L().Warn("Cannot prompt for passphrase in daemon mode",

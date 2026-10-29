@@ -2,6 +2,9 @@ package forwarding
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +13,7 @@ import (
 	"github.com/hallelujah-shih/ssh-multihop/internal/tunnel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 // TestRemoteListenToRemote_String verifies string representation
@@ -369,6 +373,50 @@ func TestRemoteListenToRemote_TwoDistinctSignatures(t *testing.T) {
 	assert.Equal(t, "dc4.example.com", targetSig.Hostname)
 }
 
+// TestRemoteListenToRemote_LeakHeal: the rlr source-side twin of
+// TestRemoteListenToLocal_LeakHeal, assembled like
+// TestRemoteListenToRemote_DenyPrefix (single server, both hops on it).
+// Same R2 P0-1/P0-2 constraints: OCCUPIED probe output, explicit source
+// port, and leaked.Close() BEFORE Stop.
+func TestRemoteListenToRemote_LeakHeal(t *testing.T) {
+	server := newTestSSHServer(t) // 非 reject 模式；占用仿真生效
+	server.setSessionOutput("OCCUPIED", 0)
+	pool, hops := newTestConnectionManager(t, server)
+
+	sig := connection.ConnectionSignature{
+		Username: hops[0].User,
+		Hostname: hops[0].HostName,
+		Port:     hops[0].Port,
+	}
+	pooled, err := pool.Acquire(t.Context(), sig, "leak-seed-rlr")
+	require.NoError(t, err)
+	// Seed the leak on the source side without ever cancelling (lost
+	// cancel-tcpip-forward). The client-side entry stays until
+	// leaked.Close() below (R2 P0-2 sequencing). Seed and source bind
+	// share one free port — the testdouble denies only explicit binds.
+	port := freePort(t)
+	source := fmt.Sprintf("127.0.0.1:%d", port)
+	leaked, err := pooled.Client.Listen("tcp", source)
+	require.NoError(t, err)
+
+	inf := NewRemoteListenToRemote(source, "testdouble", port, hops,
+		"127.0.0.1:9999", "testdouble", 9999, hops,
+		"leak-heal-rlr", db.NewTestDB(t), pool, 0)
+	inf.AllowLeakRecovery = true
+	require.NoError(t, inf.Start(t.Context()))
+
+	// Heal assertions: one cancel request was sent; the only held forward
+	// left is inf's own (the seed was retracted).
+	assert.Equal(t, 1, server.cancelRequests())
+	held := server.heldForwards()
+	assert.Len(t, held, 1, "leaked listener must be retracted, inf's own remains")
+
+	// R2 P0-2: retract the seed's client-side entry BEFORE Stop so
+	// forwardList.remove hits the seed entry, not inf's own.
+	_ = leaked.Close()
+	require.NoError(t, inf.Stop())
+}
+
 // TestRemoteListenToRemote_MultiHopJumpChain verifies multi-hop jump chain building
 func TestRemoteListenToRemote_MultiHopJumpChain(t *testing.T) {
 	hops := []*tunnel.HopConfig{
@@ -413,4 +461,81 @@ func TestRemoteListenToRemote_MultiHopJumpChain(t *testing.T) {
 	assert.Equal(t, []string{"jump1", "jump2"}, sig.JumpChain)
 	assert.Equal(t, "user3", sig.Username, "Should use final hop user")
 	assert.Equal(t, "vmr.example.com", sig.Hostname, "Should use final hop hostname")
+}
+
+func TestRemoteListenToRemote_E2EProbeHealthyKeepsRunning(t *testing.T) {
+	zap.ReplaceGlobals(zap.NewNop())
+
+	server := newTestSSHServer(t) // default exec output: E2E_OPEN
+	pool, hops := newTestConnectionManager(t, server)
+	shrinkE2EProbeTimeout(t, 50*time.Millisecond)
+
+	inf := NewRemoteListenToRemote("127.0.0.1:0", "testdouble", server.port(), hops,
+		"127.0.0.1:9999", "testdouble", server.port(), hops,
+		"e2e-rlr-healthy", db.NewTestDB(t), pool, 0)
+	inf.e2eInterval = 100 * time.Millisecond
+	require.NoError(t, inf.Start(t.Context()))
+	defer func() { _ = inf.Stop() }()
+
+	// Fixed wait ≥5×interval: several probes must have run and left us running.
+	time.Sleep(700 * time.Millisecond)
+	assert.Equal(t, StatusRunning, inf.Status())
+}
+
+func TestRemoteListenToRemote_E2EProbeFailDies(t *testing.T) {
+	zap.ReplaceGlobals(zap.NewNop())
+
+	server := newTestSSHServer(t)
+	server.setSessionOutput("E2E_FAIL", 0)
+	pool, hops := newTestConnectionManager(t, server)
+	testDB := db.NewTestDB(t)
+	shrinkE2EProbeTimeout(t, 50*time.Millisecond)
+
+	forwardID := "e2e-rlr-fail"
+	inf := NewRemoteListenToRemote("127.0.0.1:0", "testdouble", server.port(), hops,
+		"127.0.0.1:9999", "testdouble", server.port(), hops,
+		forwardID, testDB, pool, 0)
+	inf.e2eInterval = 100 * time.Millisecond
+	require.NoError(t, inf.Start(t.Context()))
+	sourcePort := inf.listener.Addr().(*net.TCPAddr).Port
+
+	waitFor(t, 2*time.Second, func() bool {
+		return inf.Status() == StatusError
+	})
+
+	status, err := testDB.GetStatus(forwardID)
+	require.NoError(t, err)
+	assert.Equal(t, "error", status.Status)
+	assert.True(t, strings.HasPrefix(status.ErrorMessage, "e2e probe failed"),
+		"error_message must carry the e2e prefix, got %q", status.ErrorMessage)
+
+	// The failure path cancels the context: the source listener must go away.
+	waitFor(t, 2*time.Second, func() bool {
+		c, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", sourcePort), 200*time.Millisecond)
+		if derr != nil {
+			return true
+		}
+		_ = c.Close()
+		return false
+	})
+}
+
+func TestRemoteListenToRemote_E2EProbeUnknownKeepsRunning(t *testing.T) {
+	zap.ReplaceGlobals(zap.NewNop())
+
+	server := newTestSSHServer(t)
+	server.setSessionDelay(1 * time.Second) // exec slower than the shrunk probe timeout
+	pool, hops := newTestConnectionManager(t, server)
+	shrinkE2EProbeTimeout(t, 50*time.Millisecond)
+
+	inf := NewRemoteListenToRemote("127.0.0.1:0", "testdouble", server.port(), hops,
+		"127.0.0.1:9999", "testdouble", server.port(), hops,
+		"e2e-rlr-unknown", db.NewTestDB(t), pool, 0)
+	inf.e2eInterval = 100 * time.Millisecond
+	require.NoError(t, inf.Start(t.Context()))
+	defer func() { _ = inf.Stop() }()
+
+	// Fixed wait >probeTimeout+2×interval: unknown verdicts must not touch state.
+	time.Sleep(700 * time.Millisecond)
+	assert.Equal(t, StatusRunning, inf.Status())
 }

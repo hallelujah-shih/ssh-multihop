@@ -1,0 +1,111 @@
+package daemoncfg
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestLoadEnvFile_MissingFileIsError(t *testing.T) {
+	_, err := LoadEnvFile(filepath.Join(t.TempDir(), "absent"))
+	require.Error(t, err)
+}
+
+func TestLoadEnvFile_ParsesValuesAndStripsPairedQuotes(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "env")
+	content := "# comment\n; also comment\n\nPLAIN=hello\nQUOTED=\"hi there\"\nSINGLE='x y'\nHASH_IN_VALUE=a#b\nSEMI_IN_VALUE=c;d\n"
+	require.NoError(t, os.WriteFile(p, []byte(content), 0o600))
+
+	n, err := LoadEnvFile(p)
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
+	t.Cleanup(func() {
+		_ = os.Unsetenv("PLAIN")
+		_ = os.Unsetenv("QUOTED")
+		_ = os.Unsetenv("SINGLE")
+		_ = os.Unsetenv("HASH_IN_VALUE")
+		_ = os.Unsetenv("SEMI_IN_VALUE")
+	})
+
+	for name, want := range map[string]string{
+		"PLAIN": "hello", "QUOTED": "hi there", "SINGLE": "x y",
+		"HASH_IN_VALUE": "a#b", "SEMI_IN_VALUE": "c;d",
+	} {
+		got, ok := os.LookupEnv(name)
+		require.True(t, ok, name)
+		assert.Equal(t, want, got, name)
+	}
+}
+
+func TestLoadEnvFile_ExportPrefixLineIsInvalidAndSkipped(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "env")
+	require.NoError(t, os.WriteFile(p, []byte("export FOO=bar\nGOOD=1\n"), 0o600))
+	n, err := LoadEnvFile(p)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	t.Cleanup(func() { _ = os.Unsetenv("GOOD") })
+	_, ok := os.LookupEnv("export FOO")
+	assert.False(t, ok)
+}
+
+func TestLoadEnvFile_DoesNotOverrideExisting(t *testing.T) {
+	t.Setenv("EXISTING_VAR", "original")
+	p := filepath.Join(t.TempDir(), "env")
+	require.NoError(t, os.WriteFile(p, []byte("EXISTING_VAR=overwritten\n"), 0o600))
+	_, err := LoadEnvFile(p)
+	require.NoError(t, err)
+	got, _ := os.LookupEnv("EXISTING_VAR")
+	assert.Equal(t, "original", got)
+}
+
+func TestLoadEnvFile_SkipsInvalidLinesWithWarning(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "env")
+	require.NoError(t, os.WriteFile(p, []byte("NO_EQUALS_SIGN\nOK=1\n"), 0o600))
+	n, err := LoadEnvFile(p)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	t.Cleanup(func() { _ = os.Unsetenv("OK") })
+	got, ok := os.LookupEnv("OK")
+	require.True(t, ok)
+	assert.Equal(t, "1", got)
+}
+
+func TestLoadEnvFile_WarnsOnLoosePermissions(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "env")
+	require.NoError(t, os.WriteFile(p, []byte("LOOSE=1\n"), 0o644))
+	_, err := LoadEnvFile(p)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Unsetenv("LOOSE") })
+}
+
+func TestLoadEnvFile_QuoteStrippingStripsOnlyPairedSurroundingQuotes(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "env")
+	content := "UQ1=\"unterminated\nUQ2=unterminated\"\nUQ3=\"in\"ner\"\nUQ4='mix\"ed'\nUQ5=\"\"\n"
+	require.NoError(t, os.WriteFile(p, []byte(content), 0o600))
+
+	n, err := LoadEnvFile(p)
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
+	t.Cleanup(func() {
+		_ = os.Unsetenv("UQ1")
+		_ = os.Unsetenv("UQ2")
+		_ = os.Unsetenv("UQ3")
+		_ = os.Unsetenv("UQ4")
+		_ = os.Unsetenv("UQ5")
+	})
+
+	for name, want := range map[string]string{
+		"UQ1": "\"unterminated",
+		"UQ2": "unterminated\"",
+		"UQ3": "in\"ner",
+		"UQ4": "mix\"ed",
+		"UQ5": "",
+	} {
+		got, ok := os.LookupEnv(name)
+		require.True(t, ok, name)
+		assert.Equal(t, want, got, name)
+	}
+}
