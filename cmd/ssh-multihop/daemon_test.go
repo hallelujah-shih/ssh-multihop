@@ -208,5 +208,10 @@ func TestInitKeysForRun_ExplicitGoodKeySucceeds(t *testing.T) {
 func TestInitKeysForRun_AutoWithExternalAgentTakesAgentPath(t *testing.T) {
 	// auto 模式 + 外部 agent: 不初始化内置 agent, 返回 nil（现状短路语义）
 	t.Setenv("SSH_AUTH_SOCK", startFakeAgent(t))
-	require.NoError(t, initKeysForRun(&daemoncfg.Config{}, "", freshGoAgentInit))
+	calls := 0
+	require.NoError(t, initKeysForRun(&daemoncfg.Config{}, "", func(opts agentpkg.LoadOptions) error {
+		calls++
+		return freshGoAgentInit(opts)
+	}))
+	assert.Equal(t, 0, calls, "external agent present: built-in agent must not be initialized (I2)")
 }
