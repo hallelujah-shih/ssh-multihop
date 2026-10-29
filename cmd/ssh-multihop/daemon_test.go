@@ -150,7 +150,7 @@ func startFakeAgent(t *testing.T) string {
 	require.NoError(t, ag.Add(agent.AddedKey{PrivateKey: priv}))
 	dir, err := os.MkdirTemp("", "sfa-")
 	require.NoError(t, err)
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	l, err := net.Listen("unix", filepath.Join(dir, "agent.sock"))
 	require.NoError(t, err)
 	go func() {
@@ -159,7 +159,7 @@ func startFakeAgent(t *testing.T) string {
 			if err != nil {
 				return
 			}
-			go agent.ServeAgent(ag, c)
+			go func() { _ = agent.ServeAgent(ag, c) }()
 		}
 	}()
 	t.Cleanup(func() { _ = l.Close() })

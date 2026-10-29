@@ -23,7 +23,7 @@ func LoadEnvFile(path string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to open env file %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	loaded := 0
 	sc := bufio.NewScanner(f)
@@ -74,7 +74,7 @@ func cutEnvLine(line string) (string, string, bool) {
 
 func validEnvKey(key string) bool {
 	for _, r := range key {
-		if !(r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+		if r != '_' && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
 			return false
 		}
 	}

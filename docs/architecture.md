@@ -564,9 +564,18 @@ if socket != "" {
 }
 ```
 
-### 7. Passphrase Socket
+## Daemon 配置
 
-**状态：特性当前不可用。** Daemon 会启动 passphrase socket，但 `passphrase-client` 只发送 passphrase，而服务端要求 "fingerprint passphrase" 格式（协议不匹配），且没有任何代码将 socket 注入 config builder，加密密钥的密码无法生效。
+daemon 启动时加载 YAML 配置：默认路径 `~/.ssh-multihop/config.yaml`，`--config <path>` 显式指定。默认路径缺失即为空配置（自动收集模式）；显式指定的配置文件缺失则启动失败。
+
+```yaml
+ssh_dir: /home/shih/.ssh            # 可选，覆盖 ssh config 与私钥目录
+keys:                                # 可选，配置即严格模式：任一 key 加载失败 daemon 拒绝启动
+  - path: /home/shih/.ssh/dc
+    passphrase_env: DC_KEY_PASSPHRASE   # 可选，仅在 key 需要解密时读取该变量
+```
+
+`--env-file <path>` 提供环境变量（每行 `KEY=VALUE`，`#`/`;` 开头为注释，成对引号剥离，不覆盖已有变量），是加密 key 口令的注入来源。
 
 ## 性能优化总结
 

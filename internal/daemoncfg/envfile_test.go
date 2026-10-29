@@ -22,7 +22,13 @@ func TestLoadEnvFile_ParsesValuesAndStripsPairedQuotes(t *testing.T) {
 	n, err := LoadEnvFile(p)
 	require.NoError(t, err)
 	assert.Equal(t, 5, n)
-	t.Cleanup(func() { os.Unsetenv("PLAIN"); os.Unsetenv("QUOTED"); os.Unsetenv("SINGLE"); os.Unsetenv("HASH_IN_VALUE"); os.Unsetenv("SEMI_IN_VALUE") })
+	t.Cleanup(func() {
+		_ = os.Unsetenv("PLAIN")
+		_ = os.Unsetenv("QUOTED")
+		_ = os.Unsetenv("SINGLE")
+		_ = os.Unsetenv("HASH_IN_VALUE")
+		_ = os.Unsetenv("SEMI_IN_VALUE")
+	})
 
 	for name, want := range map[string]string{
 		"PLAIN": "hello", "QUOTED": "hi there", "SINGLE": "x y",
@@ -40,7 +46,7 @@ func TestLoadEnvFile_ExportPrefixLineIsInvalidAndSkipped(t *testing.T) {
 	n, err := LoadEnvFile(p)
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
-	t.Cleanup(func() { os.Unsetenv("GOOD") })
+	t.Cleanup(func() { _ = os.Unsetenv("GOOD") })
 	_, ok := os.LookupEnv("export FOO")
 	assert.False(t, ok)
 }
@@ -61,7 +67,7 @@ func TestLoadEnvFile_SkipsInvalidLinesWithWarning(t *testing.T) {
 	n, err := LoadEnvFile(p)
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
-	t.Cleanup(func() { os.Unsetenv("OK") })
+	t.Cleanup(func() { _ = os.Unsetenv("OK") })
 	got, ok := os.LookupEnv("OK")
 	require.True(t, ok)
 	assert.Equal(t, "1", got)
@@ -72,7 +78,7 @@ func TestLoadEnvFile_WarnsOnLoosePermissions(t *testing.T) {
 	require.NoError(t, os.WriteFile(p, []byte("LOOSE=1\n"), 0o644))
 	_, err := LoadEnvFile(p)
 	require.NoError(t, err)
-	t.Cleanup(func() { os.Unsetenv("LOOSE") })
+	t.Cleanup(func() { _ = os.Unsetenv("LOOSE") })
 }
 
 func TestLoadEnvFile_QuoteStrippingStripsOnlyPairedSurroundingQuotes(t *testing.T) {
@@ -84,11 +90,11 @@ func TestLoadEnvFile_QuoteStrippingStripsOnlyPairedSurroundingQuotes(t *testing.
 	require.NoError(t, err)
 	assert.Equal(t, 5, n)
 	t.Cleanup(func() {
-		os.Unsetenv("UQ1")
-		os.Unsetenv("UQ2")
-		os.Unsetenv("UQ3")
-		os.Unsetenv("UQ4")
-		os.Unsetenv("UQ5")
+		_ = os.Unsetenv("UQ1")
+		_ = os.Unsetenv("UQ2")
+		_ = os.Unsetenv("UQ3")
+		_ = os.Unsetenv("UQ4")
+		_ = os.Unsetenv("UQ5")
 	})
 
 	for name, want := range map[string]string{

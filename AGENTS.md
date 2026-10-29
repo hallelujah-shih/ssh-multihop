@@ -223,12 +223,12 @@ logger.Error("Failed to start forward",
 ## Project Structure
 ```
 cmd/ssh-multihop/          # Main entry point
-cmd/passphrase-client/     # Passphrase socket test client
 internal/
 ├── agent/                # SSH agent implementation
 ├── api/                   # REST API handlers
 ├── config/                # SSH config parser
 ├── connection/            # SSH connection management
+├── daemoncfg/             # Daemon config loading (YAML + env file)
 ├── db/                    # SQLite via GORM
 ├── forwarding/            # Forward implementations
 ├── service/               # ForwardService (lifecycle)
