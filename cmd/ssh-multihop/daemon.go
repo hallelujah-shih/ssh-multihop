@@ -226,6 +226,10 @@ func runDaemon(c *cli.Context) error {
 		return fmt.Errorf("failed to create service: %w", err)
 	}
 
+	if sshConfigPath != "" {
+		svc.SetSSHConfigPath(sshConfigPath)
+	}
+
 	// Start service (load and start all forwards)
 	if err := svc.Start(); err != nil {
 		// Cleanup service if start fails

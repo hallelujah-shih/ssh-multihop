@@ -54,6 +54,10 @@ type ForwardService struct {
 	sshConfigCache map[string]*config.SSHConfig // configPath -> parsed SSH config
 	cacheMu        sync.RWMutex                 // Protect sshConfigCache
 
+	// sshConfigPath overrides the SSH config location (daemon config ssh_dir);
+	// empty means the default ~/.ssh/config (RUID semantics)
+	sshConfigPath string
+
 	// hopResolver resolves a hostname to SSH hop chain (injectable for tests)
 	hopResolver func(hostname string) ([]*tunnel.HopConfig, error)
 }
@@ -85,7 +89,10 @@ func New(database *db.Database) (*ForwardService, error) {
 		maxBackoff:          120 * time.Second, // max backoff 120s
 		pendingStarts:       make(map[string]bool),
 		sshConfigCache:      make(map[string]*config.SSHConfig),
-		hopResolver:         forwarding.BuildHopChainFromSSHConfig,
+	}
+
+	s.hopResolver = func(host string) ([]*tunnel.HopConfig, error) {
+		return forwarding.BuildHopChainFromSSHConfig(host, s.sshConfigPath)
 	}
 
 	// Create connection manager with hop config provider (closure captures s)
@@ -116,7 +123,10 @@ func NewWithContext(ctx context.Context, database *db.Database) (*ForwardService
 		maxBackoff:          120 * time.Second, // max backoff 120s
 		pendingStarts:       make(map[string]bool),
 		sshConfigCache:      make(map[string]*config.SSHConfig),
-		hopResolver:         forwarding.BuildHopChainFromSSHConfig,
+	}
+
+	s.hopResolver = func(host string) ([]*tunnel.HopConfig, error) {
+		return forwarding.BuildHopChainFromSSHConfig(host, s.sshConfigPath)
 	}
 
 	// Create connection manager with hop config provider (closure captures s)
@@ -127,6 +137,12 @@ func NewWithContext(ctx context.Context, database *db.Database) (*ForwardService
 	s.pool = pool
 
 	return s, nil
+}
+
+// SetSSHConfigPath overrides the SSH config location (daemon config ssh_dir).
+// Must be called before Start so hop resolution and the config cache use it.
+func (s *ForwardService) SetSSHConfigPath(path string) {
+	s.sshConfigPath = path
 }
 
 // Start starts all forwards from database
@@ -1102,12 +1118,15 @@ func (s *ForwardService) buildHopsFromSignature(sig connection.ConnectionSignatu
 		return []*tunnel.HopConfig{}, nil
 	}
 
-	// Get SSH config path
-	homeDir, err := util.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get home directory: %w", err)
+	// Get SSH config path (ssh_dir override, falling back to the default)
+	configPath := s.sshConfigPath
+	if configPath == "" {
+		homeDir, err := util.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get home directory: %w", err)
+		}
+		configPath = filepath.Join(homeDir, ".ssh", "config")
 	}
-	configPath := filepath.Join(homeDir, ".ssh", "config")
 
 	// Try to get from cache first
 	s.cacheMu.RLock()

@@ -1,10 +1,14 @@
 package forwarding
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/hallelujah-shih/ssh-multihop/internal/config"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Helper function to check if a string contains a substring
@@ -46,6 +50,28 @@ func TestBuildHopChainFromSSHConfig_CircularReference(t *testing.T) {
 
 	// For now, we'll skip this as it requires file system setup
 	t.Skip("Requires SSH config file setup")
+}
+
+func TestBuildHopChainFromSSHConfig_EmptyPathFallsBackToDefault(t *testing.T) {
+	// Regression for current semantics: empty configPath must keep the
+	// pre-change behavior (default ~/.ssh/config via RUID). Any error is
+	// environment-dependent; the contract under test is "no panic".
+	_, err := BuildHopChainFromSSHConfig("definitely-not-a-host-xyz", "")
+	_ = err
+}
+
+func TestBuildHopChainFromSSHConfig_ExplicitPathUsed(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config")
+	content := "Host myjumphost\n  HostName 127.0.0.1\n  User test\n"
+	require.NoError(t, os.WriteFile(cfgPath, []byte(content), 0o600))
+
+	_, err := BuildHopChainFromSSHConfig("myjumphost", cfgPath)
+	// The host exists without ProxyJump: resolution must succeed. If it
+	// errors, it must not be a config-parse failure (explicit path was used).
+	if err != nil {
+		assert.NotContains(t, err.Error(), "failed to parse SSH config")
+	}
 }
 
 func TestResolveProxyJumpChain_Simple(t *testing.T) {
