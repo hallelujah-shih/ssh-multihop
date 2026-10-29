@@ -13,7 +13,7 @@ import (
 
 	"github.com/hallelujah-shih/ssh-multihop/internal/agent"
 	"github.com/hallelujah-shih/ssh-multihop/internal/api"
-	"github.com/hallelujah-shih/ssh-multihop/internal/connection"
+	"github.com/hallelujah-shih/ssh-multihop/internal/daemoncfg"
 	"github.com/hallelujah-shih/ssh-multihop/internal/db"
 	"github.com/hallelujah-shih/ssh-multihop/internal/service"
 	"github.com/hallelujah-shih/ssh-multihop/internal/util"
@@ -96,8 +96,12 @@ var daemonCommand = &cli.Command{
 			Value: "info",
 		},
 		&cli.StringFlag{
-			Name:  "passphrase-socket",
-			Usage: "Path to Unix socket for receiving SSH key passphrases (default: $XDG_RUNTIME_DIR/ssh-multihop/passphrase.sock or /tmp/ssh-multihop-<uid>/passphrase.sock)",
+			Name:  "config",
+			Usage: "Path to daemon config YAML (default: ~/.ssh-multihop/config.yaml; missing default = built-in defaults)",
+		},
+		&cli.StringFlag{
+			Name:  "env-file",
+			Usage: "Environment file (KEY=VALUE) providing key passphrases",
 		},
 	},
 	Action: func(c *cli.Context) error {
@@ -116,7 +120,6 @@ func runDaemon(c *cli.Context) error {
 	dbPath := c.String("db")
 	host := c.String("host")
 	port := c.Int("port")
-	passphraseSocketPath := c.String("passphrase-socket")
 
 	// Set default db path if not specified
 	// Use util.UserHomeDir() for setuid/setgid compatibility
@@ -128,15 +131,42 @@ func runDaemon(c *cli.Context) error {
 		dbPath = filepath.Join(homeDir, ".ssh-multihop", "ssh-multihop-fwd.db")
 	}
 
-	// Set default passphrase socket path if not specified
-	if passphraseSocketPath == "" {
-		uid := os.Getuid()
-		if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
-			passphraseSocketPath = filepath.Join(runtimeDir, "ssh-multihop", "passphrase.sock")
-		} else {
-			passphraseSocketPath = filepath.Join(os.TempDir(), fmt.Sprintf("ssh-multihop-%d", uid), "passphrase.sock")
+	configFlag := c.String("config")
+	var cfg *daemoncfg.Config
+	var err error
+	if configFlag != "" {
+		cfg, err = daemoncfg.Load(configFlag)
+		if err != nil {
+			return fmt.Errorf("failed to load config: %w", err)
+		}
+	} else {
+		cfg, err = daemoncfg.LoadDefault()
+		if err != nil {
+			return fmt.Errorf("failed to load default config: %w", err)
+		}
+		configFlag, _ = daemoncfg.DefaultPath() // S1: 默认路径也实打日志（可能为空串, 仅日志用途）
+	}
+	envLoaded := 0
+	if envFile := c.String("env-file"); envFile != "" {
+		var envErr error
+		envLoaded, envErr = daemoncfg.LoadEnvFile(envFile)
+		if envErr != nil {
+			return fmt.Errorf("failed to load env file: %w", envErr)
 		}
 	}
+	if err := cfg.ResolvedKeyPaths(); err != nil {
+		return fmt.Errorf("invalid key paths in config: %w", err)
+	}
+	sshConfigPath, err := cfg.ResolvedSSHConfigPath()
+	if err != nil {
+		return fmt.Errorf("invalid ssh_dir: %w", err)
+	}
+	zap.L().Info("Daemon configuration loaded",
+		zap.String("config", configFlag),
+		zap.Bool("explicit_keys", cfg.ExplicitKeys()),
+		zap.Int("keys", len(cfg.Keys)),
+		zap.Int("env_vars_loaded", envLoaded),
+		zap.String("ssh_config", sshConfigPath))
 
 	// Ensure database directory exists
 	dbDir := filepath.Dir(dbPath)
@@ -144,16 +174,9 @@ func runDaemon(c *cli.Context) error {
 		return fmt.Errorf("failed to create database directory: %w", err)
 	}
 
-	// Ensure passphrase socket directory exists
-	socketDir := filepath.Dir(passphraseSocketPath)
-	if err := os.MkdirAll(socketDir, 0700); err != nil {
-		return fmt.Errorf("failed to create socket directory: %w", err)
-	}
-
 	zap.L().Info("Starting SSH multi-hop forwarding daemon",
 		zap.String("db_path", dbPath),
-		zap.String("api_addr", net.JoinHostPort(host, strconv.Itoa(port))),
-		zap.String("passphrase_socket", passphraseSocketPath))
+		zap.String("api_addr", net.JoinHostPort(host, strconv.Itoa(port))))
 
 	// Debug: Log SSH_AUTH_SOCK environment variable
 	sshAuthSock := os.Getenv("SSH_AUTH_SOCK")
@@ -164,45 +187,13 @@ func runDaemon(c *cli.Context) error {
 		zap.Int("gid", os.Getgid()),
 		zap.Int("egid", os.Getegid()))
 
-	// Check for existing SSH agent before initializing built-in agent
-	externalSocket, keyCount, err := agent.CheckExternalAgent()
-
-	zap.L().Debug("External SSH agent check result",
-		zap.String("socket", externalSocket),
-		zap.Int("keys", keyCount),
-		zap.Error(err))
-
-	if err == nil && externalSocket != "" && keyCount > 0 {
-		// Found a working external agent (e.g., GNOME Keyring, ssh-agent)
-		zap.L().Info("Using existing SSH agent",
-			zap.String("socket", externalSocket),
-			zap.Int("keys", keyCount))
-	} else {
-		// No external agent available, initialize built-in agent
-		// Clean up any orphaned ssh-agent processes from previous crashes
-		if err := agent.CleanupOrphanedAgents(); err != nil {
-			zap.L().Warn("Failed to clean up orphaned SSH agents",
-				zap.Error(err))
-		}
-
-		// Initialize built-in SSH agent early, before any SSH connections
-		if _, err := agent.GetBuiltInAgent(agent.LoadOptions{}); err != nil {
-			zap.L().Warn("Failed to initialize built-in SSH agent",
-				zap.Error(err))
-			// Continue anyway - might be able to use external agent or keys
-		}
+	if err := initKeysForRun(cfg, sshConfigPath, func(opts agent.LoadOptions) error {
+		_, err := agent.GetBuiltInAgent(opts)
+		return err
+	}); err != nil {
+		return err
 	}
 
-	// Start passphrase socket if configured
-	var passphraseSocket *connection.PassphraseSocket
-	if passphraseSocketPath != "" {
-		passphraseSocket = connection.NewPassphraseSocket(passphraseSocketPath)
-		if err := passphraseSocket.Start(); err != nil {
-			return fmt.Errorf("failed to start passphrase socket: %w", err)
-		}
-		defer passphraseSocket.Stop()
-		zap.L().Info("Passphrase socket started", zap.String("socket", passphraseSocketPath))
-	}
 	// Initialize database
 	database, err := db.New(db.Config{Path: dbPath})
 	if err != nil {
@@ -329,5 +320,41 @@ func runDaemon(c *cli.Context) error {
 		}
 	}
 
+	return nil
+}
+
+// initKeysForRun initializes key material per config mode.
+// Explicit mode is fatal on any key failure; auto mode keeps today's lenient behavior.
+// initAgent is injected: runDaemon passes the real GetBuiltInAgent closure; tests
+// construct per-call loaders (process-wide sync.Once would make tests order-coupled).
+func initKeysForRun(cfg *daemoncfg.Config, sshConfigPath string, initAgent func(agent.LoadOptions) error) error {
+	externalSocket, keyCount, err := agent.CheckExternalAgent()
+	if err != nil {
+		zap.L().Warn("External SSH agent check failed", zap.Error(err))
+	}
+	if cfg.ExplicitKeys() {
+		// Strict mode: configured keys must load regardless of any external agent.
+		if err := initAgent(agent.LoadOptions{Keys: cfg.Keys, SSHConfigPath: sshConfigPath}); err != nil {
+			return fmt.Errorf("failed to load configured SSH keys: %w", err)
+		}
+		if externalSocket != "" {
+			zap.L().Info("Configured keys loaded; external agent preferred for authentication",
+				zap.String("socket", externalSocket))
+		}
+		return nil
+	}
+	if err == nil && externalSocket != "" && keyCount > 0 {
+		zap.L().Info("Using existing SSH agent",
+			zap.String("socket", externalSocket),
+			zap.Int("keys", keyCount))
+		return nil
+	}
+	// CleanupOrphanedAgents 保留现状调用（pure Go agent 下为 no-op, 行为零变化）
+	if err := agent.CleanupOrphanedAgents(); err != nil {
+		zap.L().Warn("Failed to clean up orphaned SSH agents", zap.Error(err))
+	}
+	if err := initAgent(agent.LoadOptions{SSHConfigPath: sshConfigPath}); err != nil {
+		zap.L().Warn("Failed to initialize built-in SSH agent", zap.Error(err))
+	}
 	return nil
 }
